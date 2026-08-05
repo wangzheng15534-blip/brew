@@ -645,6 +645,47 @@ module Homebrew
                      "from homebrew-core.",
         boolean:     :set,
       },
+      HOMEBREW_OVERLAY:                          {
+        description: "If set, automatically use a per-user writable overlay when the current Homebrew prefix " \
+                     "is not writable. The base and optional shared environment remain read-only parents.",
+        boolean:     true,
+      },
+      HOMEBREW_OVERLAY_ACTIVE:                   {
+        description: "Marks a Homebrew process as running inside an initialized overlay environment.",
+        boolean:     true,
+        hidden:      true,
+      },
+      HOMEBREW_OVERLAY_BASE_PREFIX:              {
+        description: "Use this read-only Homebrew prefix as the base parent for overlay environments.",
+      },
+      HOMEBREW_OVERLAY_ENV:                      {
+        description: "Use this name for the automatically selected per-user overlay environment.",
+        default:     "default",
+      },
+      HOMEBREW_OVERLAY_FORCE:                    {
+        description: "If set with `$HOMEBREW_OVERLAY`, use a per-user overlay even when the base prefix is writable.",
+        boolean:     true,
+      },
+      HOMEBREW_OVERLAY_PARENT_PREFIXES:          {
+        description: "A colon-separated, highest-precedence-first list of read-only parent environment prefixes.",
+      },
+      HOMEBREW_OVERLAY_SHARED_ENV:               {
+        description: "Use this admin-managed shared environment as a parent before the base prefix.",
+      },
+      HOMEBREW_OVERLAY_SHARED_ENV_DIR:           {
+        description: "Use this directory for admin-managed shared overlay environments.",
+        default:     "/develop/homebrew/envs",
+      },
+      HOMEBREW_OVERLAY_USER_CELLAR:              {
+        description: "Use this writable package Cellar for the active per-user overlay environment.",
+        hidden:      true,
+      },
+      HOMEBREW_OVERLAY_USER_ENV_DIR:             {
+        description: "Use this directory for per-user overlay environment prefixes.",
+      },
+      HOMEBREW_OVERLAY_USER_PACKAGE_DIR:         {
+        description: "Use this directory for per-user overlay package stores.",
+      },
       HOMEBREW_PIP_INDEX_URL:                    {
         description:  "If set, `brew install` <formula> will use this URL to download PyPI package resources.",
         default_text: "`https://pypi.org/simple`.",
