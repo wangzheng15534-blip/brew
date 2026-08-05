@@ -107,8 +107,7 @@ homebrew-list() {
         local rack
         for rack in "${HOMEBREW_CELLAR}"/*
         do
-          [[ -d "${rack}" ]] || continue
-          [[ -n "${HOMEBREW_OVERLAY_ACTIVE:-}" || ! -L "${rack}" ]] || continue
+          [[ -d "${rack}" && ! -L "${rack}" ]] || continue
           [[ "${rack##*/}" != .* ]] || continue
 
           local linked_version=""

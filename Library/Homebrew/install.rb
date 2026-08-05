@@ -11,7 +11,6 @@ require "download_queue"
 require "ask"
 require "utils/output"
 require "utils/topological_hash"
-require "overlay"
 
 module Homebrew
   # Helper module for performing (pre-)install checks.
@@ -255,8 +254,6 @@ module Homebrew
         return false unless formula.opt_prefix.directory?
 
         keg = Keg.new(formula.opt_prefix.resolved_path)
-        return false if Homebrew::Overlay.inherited_keg?(keg.to_path)
-
         tab = keg.tab
         unless tab.installed_on_request
           tab.installed_on_request = true

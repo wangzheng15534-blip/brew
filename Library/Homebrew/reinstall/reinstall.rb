@@ -1,8 +1,6 @@
 # typed: strict
 # frozen_string_literal: true
 
-require "overlay"
-
 module Homebrew
   module Reinstall
     extend Utils::Output::Mixin
@@ -85,31 +83,22 @@ module Homebrew
         options = install_context.options
         link_keg = install_context.link_keg
         verbose = formula_installer.verbose?
-        inherited_keg = T.let(!keg.nil? && Homebrew::Overlay.inherited_keg?(keg.to_path), T::Boolean)
 
         formula_installer.check_installation_already_attempted
 
         oh1 "Reinstalling #{Formatter.identifier(formula.full_name)} #{options.to_a.join " "}"
 
-        if keg
-          inherited_keg ? keg.unlink : backup(keg)
-        end
+        backup keg if keg
         formula_installer.install
         formula_installer.finish
       rescue FormulaInstallationAlreadyAttemptedError
         nil
         # Any other exceptions we want to restore the previous keg and report the error.
       rescue Exception # rubocop:disable Lint/RescueException
-        ignore_interrupts do
-          if inherited_keg
-            Homebrew::Overlay.sync!
-          elsif keg
-            restore_backup(keg, link_keg, verbose:)
-          end
-        end
+        ignore_interrupts { restore_backup(keg, link_keg, verbose:) if keg }
         raise
       else
-        if keg && !inherited_keg
+        if keg
           backup_keg = backup_path(keg)
           begin
             FileUtils.rm_r(backup_keg) if backup_keg.exist?

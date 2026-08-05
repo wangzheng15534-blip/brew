@@ -28,15 +28,10 @@ then
 fi
 
 # Where we store built products; a Cellar in HOMEBREW_PREFIX (often /usr/local
-# for bottles) unless there's already a Cellar in HOMEBREW_REPOSITORY. Overlay
-# environments always use their own logical Cellar, whose racks point to the
-# selected writable or inherited package store.
+# for bottles) unless there's already a Cellar in HOMEBREW_REPOSITORY.
 # These variables are set by bin/brew
 # shellcheck disable=SC2154
-if [[ -n "${HOMEBREW_OVERLAY_ACTIVE:-}" ]]
-then
-  HOMEBREW_CELLAR="${HOMEBREW_PREFIX}/Cellar"
-elif [[ -d "${HOMEBREW_REPOSITORY}/Cellar" ]]
+if [[ -d "${HOMEBREW_REPOSITORY}/Cellar" ]]
 then
   HOMEBREW_CELLAR="${HOMEBREW_REPOSITORY}/Cellar"
 else
