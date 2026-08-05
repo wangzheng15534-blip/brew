@@ -40,7 +40,7 @@ ln -s "../Caskroom/demo/1.0/demo" "${base}/bin/demo-cask"
 ln -s "${repository}/bin/brew" "${base}/bin/brew"
 # A Cellar oldname is metadata, not another independently installed formula.
 ln -s foo "${base}/Cellar/foo-old"
-printf 'generation-1\n' >"${base}/var/homebrew/overlay-generation"
+homebrew-overlay-ensure-generation "${base}"
 
 # A user brew.env is user-owned and must survive initialization unchanged.
 mkdir -p "${user_prefix}/etc/homebrew"
@@ -55,6 +55,8 @@ test -d "${user_prefix}/Caskroom"
 test -L "${user_prefix}/bin/brew"
 test "$(readlink "${user_prefix}/bin/brew")" = "${repository}/bin/brew"
 test "$(stat -c '%a' "${user_prefix}/etc/homebrew/overlay.env")" = 600
+test "$(stat -c '%a' "${user_prefix}/var/homebrew/overlay-generation")" = 640
+homebrew-overlay-base-generation-valid "$(homebrew-overlay-read-generation "${user_prefix}")"
 grep -qx 'HOMEBREW_NO_ANALYTICS=1' "${user_prefix}/etc/homebrew/brew.env"
 grep -qx "HOMEBREW_OVERLAY_BASE_PREFIX=${base}" "${user_prefix}/etc/homebrew/overlay.env"
 grep -qx "HOMEBREW_OVERLAY_USER_PREFIX=${user_prefix}" "${user_prefix}/etc/homebrew/overlay.env"
@@ -140,7 +142,7 @@ rm -rf "${user_prefix}/Cellar/localonly"
 homebrew-overlay-sync --force
 test ! -e "${user_prefix}/var/homebrew/overlay/base-drift.state"
 
-printf 'generation-2\n' >"${base}/var/homebrew/overlay-generation"
+homebrew-overlay-bump-generation "${base}" >/dev/null
 new_base_generation="$(bash "${repository}/Library/Homebrew/utils/overlay.sh" --base-generation)"
 homebrew-overlay-base-generation-valid "${new_base_generation}"
 test "${new_base_generation}" != "${base_generation}"
@@ -221,8 +223,10 @@ mkdir "${user_prefix}/Cellar"
 rm -f "${user_prefix}/opt/foo" "${user_prefix}/var/homebrew/linked/foo"
 homebrew-overlay-sync --force
 
-# The default fallback is one native prefix, not an env/package-store layout.
-test "$(HOME="${home}" homebrew-overlay-default-user-prefix)" = "${home}/.linuxbrew"
+# The default fallback is always the native Linuxbrew user prefix. XDG data
+# settings must not redirect package storage into .local/share.
+test "$(HOME="${home}" XDG_DATA_HOME="${home}/xdg-data" homebrew-overlay-default-user-prefix)" = \
+  "${home}/.linuxbrew"
 test ! -e "${home}/.local/share/homebrew/envs"
 test ! -e "${home}/.local/share/homebrew/pkgs"
 

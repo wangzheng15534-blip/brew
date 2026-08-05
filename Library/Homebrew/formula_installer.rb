@@ -1157,6 +1157,7 @@ on_request: installed_on_request?, options:)
       Homebrew::Overlay.verify_base_generation!(generation)
       @overlay_local_keg_committed = true
     end
+    Homebrew::Overlay.bump_generation! unless @overlay_transaction
     self.class.installed << formula
 
     caveats

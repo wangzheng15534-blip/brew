@@ -38,6 +38,7 @@ module Homebrew
           else
             opoo "#{f}: no `post_install` method was defined in the formula!"
           end
+          Homebrew::Overlay.bump_generation!
         end
       end
     end

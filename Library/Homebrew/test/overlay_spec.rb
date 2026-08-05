@@ -21,6 +21,7 @@ RSpec.describe Homebrew::Overlay do
     stub_const("HOMEBREW_PREFIX", prefix)
     stub_const("HOMEBREW_CELLAR", user_cellar)
     allow(Homebrew::EnvConfig).to receive_messages(
+      overlay?:            true,
       overlay_active?:     true,
       overlay_base_prefix: base_prefix.to_s,
     )
@@ -213,5 +214,13 @@ RSpec.describe Homebrew::Overlay do
 
     expect(described_class.remove_inherited_prefix_link!(link)).to be(true)
     expect(link).not_to be_a_symlink
+  end
+
+  it "advances the native prefix generation through the overlay helper" do
+    script = HOMEBREW_LIBRARY_PATH/"utils/overlay.sh"
+    expect(Homebrew).to receive(:safe_system)
+      .with("/bin/bash", script, "--bump-generation", prefix.to_s)
+
+    described_class.bump_generation!
   end
 end

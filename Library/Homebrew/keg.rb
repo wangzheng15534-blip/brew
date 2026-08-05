@@ -349,8 +349,12 @@ class Keg
     remove_linked_keg_record if linked?
     remove_old_aliases
     remove_oldname_opt_records
-    restored_inherited_rack = Homebrew::Overlay.restore_inherited_rack!(name)
-    Homebrew::Overlay.sync! if Homebrew::Overlay.active? && !restored_inherited_rack
+    if Homebrew::Overlay.active?
+      restored_inherited_rack = Homebrew::Overlay.restore_inherited_rack!(name)
+      Homebrew::Overlay.sync!(mutation: true) unless restored_inherited_rack
+    else
+      Homebrew::Overlay.bump_generation!
+    end
   rescue Errno::EACCES, Errno::ENOTEMPTY
     raise if raise_failures
 
@@ -404,7 +408,9 @@ class Keg
       (dirs - self.class.must_exist_subdirectories).reverse_each(&:rmdir_if_possible)
     end
 
-    ObserverPathnameExtension.n
+    count = ObserverPathnameExtension.n
+    Homebrew::Overlay.bump_generation! unless dry_run
+    count
   end
 
   sig { params(_block: T.proc.void).void }
@@ -591,7 +597,9 @@ class Keg
     unlink(verbose:)
     raise
   else
-    ObserverPathnameExtension.n
+    count = ObserverPathnameExtension.n
+    Homebrew::Overlay.bump_generation! unless dry_run
+    count
   end
 
   sig { void }

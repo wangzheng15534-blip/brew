@@ -32,6 +32,7 @@ RSpec.describe Homebrew::Cmd::Postinstall do
       .ordered
       .and_return(installer)
     expect(installer).to receive(:post_install).ordered
+    expect(Homebrew::Overlay).to receive(:bump_generation!).ordered
 
     cmd.run
   end

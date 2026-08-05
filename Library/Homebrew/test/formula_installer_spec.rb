@@ -155,6 +155,7 @@ RSpec.describe FormulaInstaller do
       expect(formula).to receive(:install_etc_var).ordered
       expect(formula).not_to receive(:run_post_install_steps)
       expect(installer).to receive(:post_install).ordered
+      expect(Homebrew::Overlay).to receive(:bump_generation!).ordered
 
       installer.finish
     end

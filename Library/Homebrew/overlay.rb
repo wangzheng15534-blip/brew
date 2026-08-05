@@ -182,7 +182,7 @@ module Homebrew
         write_state("committed")
         @finished = true
         Overlay.clear_caches!
-        Overlay.sync!
+        Overlay.sync!(mutation: true)
         cleanup_paths!
       end
 
@@ -200,7 +200,7 @@ module Homebrew
         end
 
         Overlay.clear_caches!
-        Overlay.sync!
+        Overlay.sync!(mutation: true)
         cleanup_paths!
         @finished = true
       end
@@ -664,7 +664,7 @@ module Homebrew
 
       rack.rmdir_if_possible
       clear_caches!
-      sync!
+      sync!(mutation: true)
       true
     end
 
@@ -712,7 +712,7 @@ module Homebrew
       base_rack = base_cellar/formula_name
       return false unless base_rack.directory? && !base_rack.symlink?
 
-      sync!
+      sync!(mutation: true)
       true
     end
 
@@ -759,10 +759,22 @@ module Homebrew
       true
     end
 
+    # Advance the native prefix's explicit package generation. The generation
+    # is consumed by non-admin overlay startup to avoid recursively scanning the
+    # administrator and user Cellars on every read-only invocation.
     sig { void }
-    def self.sync!
+    def self.bump_generation!
+      return unless Homebrew::EnvConfig.overlay?
+
+      script = HOMEBREW_LIBRARY_PATH/"utils/overlay.sh"
+      Homebrew.safe_system "/bin/bash", script, "--bump-generation", HOMEBREW_PREFIX.to_s
+    end
+
+    sig { params(mutation: T::Boolean).void }
+    def self.sync!(mutation: false)
       return unless active?
 
+      bump_generation! if mutation
       script = HOMEBREW_LIBRARY_PATH/"utils/overlay.sh"
       Homebrew.safe_system "/bin/bash", script, "--sync"
       @link_state_entries = nil

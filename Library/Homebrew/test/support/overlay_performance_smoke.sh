@@ -36,6 +36,11 @@ done
 ((${#formula_paths[@]} == 0)) || mkdir -p -- "${formula_paths[@]}"
 ((${#ignored_paths[@]} == 0)) || mkdir -p -- "${ignored_paths[@]}"
 
+# A patched administrator invocation creates and subsequently bumps this
+# explicit generation after successful package mutations. This makes the
+# unchanged developer path independent of the number of installed formulae.
+homebrew-overlay-ensure-generation "${base}"
+
 export HOMEBREW_PREFIX="${user}"
 export HOMEBREW_OVERLAY_BASE_PREFIX="${base}"
 
@@ -50,7 +55,24 @@ printf 'first_ms=%s second_unchanged_ms=%s\n' "$((first_ns / 1000000))" "$((seco
 
 test "$(find "${user}/Cellar" -mindepth 1 -maxdepth 1 -type l | wc -l)" -eq "${formulae}"
 test ! -e "${user}/share/large"
-# This is deliberately generous for slow CI hosts. It guards against the prior
-# recursive, multi-second-per-root no-change implementation rather than acting
-# as a universal performance promise.
-test "$((second_ns / 1000000))" -lt 5000
+
+# Prove that the unchanged fast path no longer performs a structural `find`.
+# The test shell and flock still run, but package count is no longer on the hot
+# path. A generation change explicitly re-enables reconciliation.
+mkdir "${work}/no-find"
+cat >"${work}/no-find/find" <<'EOF_FIND'
+#!/bin/sh
+echo "unexpected find on unchanged overlay generation" >&2
+exit 97
+EOF_FIND
+chmod 0755 "${work}/no-find/find"
+PATH="${work}/no-find:${PATH}" bash "${repo}/Library/Homebrew/utils/overlay.sh" --quick-sync
+
+mkdir -p "${base}/Cellar/new-tool/1.0"
+homebrew-overlay-bump-generation "${base}" >/dev/null
+bash "${repo}/Library/Homebrew/utils/overlay.sh" --quick-sync
+test -L "${user}/Cellar/new-tool"
+
+# Generous enough for slow virtualized CI while still catching the old full
+# structural scans. The no-find assertion above is the primary regression guard.
+test "$((second_ns / 1000000))" -lt 1000

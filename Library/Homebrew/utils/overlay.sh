@@ -62,6 +62,25 @@ homebrew-overlay-base-generation-valid() {
   [[ "$1" =~ ^[0-9a-f]{64}$ ]]
 }
 
+homebrew-overlay-generation-file() {
+  local prefix="$1"
+  printf '%s\n' "${prefix}/var/homebrew/overlay-generation"
+}
+
+homebrew-overlay-read-generation() {
+  local prefix="$1"
+  local generation_file generation
+  local -a lines=()
+
+  generation_file="$(homebrew-overlay-generation-file "${prefix}")" || return 1
+  [[ -f "${generation_file}" && ! -L "${generation_file}" && -r "${generation_file}" ]] || return 1
+  mapfile -t lines <"${generation_file}" || return 1
+  ((${#lines[@]} == 1)) || return 1
+  generation="${lines[0]}"
+  homebrew-overlay-base-generation-valid "${generation}" || return 1
+  printf '%s\n' "${generation}"
+}
+
 homebrew-overlay-prefix-owned-and-writable() {
   local prefix="$1"
   local owner
@@ -130,6 +149,44 @@ homebrew-overlay-atomic-write() {
     rm -f -- "${temporary}"
     return 1
   }
+}
+
+homebrew-overlay-ensure-generation() {
+  local prefix="$1"
+  local generation_file generation
+
+  prefix="$(homebrew-overlay-normalize-absolute "${prefix}")" || return 1
+  generation_file="$(homebrew-overlay-generation-file "${prefix}")" || return 1
+  if [[ -e "${generation_file}" || -L "${generation_file}" ]]
+  then
+    homebrew-overlay-read-generation "${prefix}" >/dev/null || {
+      echo "Error: invalid Homebrew overlay generation: ${generation_file}" >&2
+      return 1
+    }
+    return 0
+  fi
+
+  homebrew-overlay-prefix-owned-and-writable "${prefix}" || return 1
+  homebrew-overlay-safe-mkdir "${prefix}" "${generation_file%/*}" || return 1
+  generation="$(homebrew-overlay-structural-view-key "${prefix}")" || return 1
+  homebrew-overlay-atomic-write "${generation_file}" 0640 <<<"${generation}" || return 1
+}
+
+homebrew-overlay-bump-generation() {
+  local prefix="$1"
+  local generation_file previous generation
+
+  prefix="$(homebrew-overlay-normalize-absolute "${prefix}")" || return 1
+  homebrew-overlay-prefix-owned-and-writable "${prefix}" || return 1
+  homebrew-overlay-ensure-generation "${prefix}" || return 1
+  generation_file="$(homebrew-overlay-generation-file "${prefix}")" || return 1
+  previous="$(homebrew-overlay-read-generation "${prefix}")" || return 1
+  generation="$({
+    printf '%s\0' "${previous}" "$(date +%s%N)" "$$" "${RANDOM}"
+  } | sha256sum | awk '{print $1}')" || return 1
+  homebrew-overlay-base-generation-valid "${generation}" || return 1
+  homebrew-overlay-atomic-write "${generation_file}" 0640 <<<"${generation}" || return 1
+  printf '%s\n' "${generation}"
 }
 
 homebrew-overlay-write-prefix-config() {
@@ -219,6 +276,11 @@ homebrew-overlay-initialize-prefix() {
 
   [[ -d "${prefix}/Cellar" && ! -L "${prefix}/Cellar" ]] || {
     echo "Error: the native user Cellar must be a real directory: ${prefix}/Cellar" >&2
+    return 1
+  }
+
+  homebrew-overlay-ensure-generation "${prefix}" || {
+    echo "Error: could not initialize the user overlay generation: ${prefix}" >&2
     return 1
   }
 
@@ -492,22 +554,15 @@ homebrew-overlay-apply-view() {
   mv -fT -- "${temporary_state}" "${state_file}" || return 1
 }
 
-homebrew-overlay-view-key() {
+homebrew-overlay-structural-view-key() {
   local prefix="$1"
   local cellar="${prefix}/Cellar"
   local opt="${prefix}/opt"
   local linked="${prefix}/var/homebrew/linked"
-  local generation="${prefix}/var/homebrew/overlay-generation"
   local listing
 
   listing="$(mktemp "${TMPDIR:-/tmp}/homebrew-overlay-key.XXXXXX")" || return 1
   {
-    if [[ -f "${generation}" && ! -L "${generation}" ]]
-    then
-      printf 'generation\0'
-      cat "${generation}" || return 1
-      printf '\0'
-    fi
     if [[ -d "${cellar}" && ! -L "${cellar}" ]]
     then
       find "${cellar}" -mindepth 1 -maxdepth 2 \
@@ -531,6 +586,25 @@ homebrew-overlay-view-key() {
   }
   sha256sum "${listing}" | awk '{print $1}'
   rm -f -- "${listing}"
+}
+
+homebrew-overlay-view-key() {
+  local prefix="$1"
+  local generation_file
+
+  generation_file="$(homebrew-overlay-generation-file "${prefix}")" || return 1
+  if [[ -e "${generation_file}" || -L "${generation_file}" ]]
+  then
+    homebrew-overlay-read-generation "${prefix}" || {
+      echo "Error: invalid Homebrew overlay generation: ${generation_file}" >&2
+      return 1
+    }
+  else
+    # Compatibility fallback for an administrator prefix that has not yet been
+    # invoked with this fork. The first writable administrator invocation
+    # materializes this exact structural key as its explicit generation.
+    homebrew-overlay-structural-view-key "${prefix}"
+  fi
 }
 
 homebrew-overlay-update-base-drift() {
@@ -624,6 +698,7 @@ homebrew-overlay-sync-transaction-dir() {
 homebrew-overlay-recover-sync() {
   local prefix="$1"
   local transaction_dir state desired state_file
+  HOMEBREW_OVERLAY_SYNC_RECOVERED=0
   transaction_dir="$(homebrew-overlay-sync-transaction-dir)"
   state="${transaction_dir}/state"
   desired="${transaction_dir}/desired"
@@ -640,6 +715,7 @@ homebrew-overlay-recover-sync() {
   }
   homebrew-overlay-apply-view "${prefix}" "${desired}" "${state_file}" || return 1
   rm -f -- "${state}" "${desired}" || return 1
+  HOMEBREW_OVERLAY_SYNC_RECOVERED=1
 }
 
 homebrew-overlay-remove-version-links() {
@@ -695,10 +771,12 @@ homebrew-overlay-recover-formula-transactions() {
   local failed_root failed_rack failed_version final_marker replacement_marker failed_marker
   local base_generation_marker recorded_generation final_marker_id replacement_marker_id failed_marker_id
 
+  HOMEBREW_OVERLAY_FORMULA_RECOVERED=0
   homebrew-overlay-safe-mkdir "${prefix}" "${transactions}" || return 1
   for transaction in "${transactions}"/*
   do
     [[ -e "${transaction}" || -L "${transaction}" ]] || continue
+    HOMEBREW_OVERLAY_FORMULA_RECOVERED=1
     if [[ ! -d "${transaction}" || -L "${transaction}" ]]
     then
       echo "Error: unsafe overlay transaction entry: ${transaction}" >&2
@@ -877,8 +955,19 @@ homebrew-overlay-sync-unlocked() {
   homebrew-overlay-recover-formula-transactions "${prefix}" "${base_prefix}" || return 1
   homebrew-overlay-recover-sync "${prefix}" || return 1
 
+  if [[ "${HOMEBREW_OVERLAY_FORMULA_RECOVERED:-0}" -eq 1 ]]
+  then
+    homebrew-overlay-bump-generation "${prefix}" >/dev/null || return 1
+    force=1
+  fi
+  if [[ "${HOMEBREW_OVERLAY_SYNC_RECOVERED:-0}" -eq 1 ]]
+  then
+    force=1
+  fi
+
+  homebrew-overlay-ensure-generation "${prefix}" || return 1
+
   base_key="$(homebrew-overlay-view-key "${base_prefix}")" || return 1
-  homebrew-overlay-update-base-drift "${prefix}" "${base_key}" || return 1
   local_key="$(homebrew-overlay-view-key "${prefix}")" || return 1
   if [[ "${force}" -eq 0 && -f "${stamp_file}" && ! -L "${stamp_file}" &&
         -f "${state_file}" && ! -L "${state_file}" ]]
@@ -890,6 +979,11 @@ homebrew-overlay-sync-unlocked() {
       return 0
     fi
   fi
+
+  # Drift is a function of the administrator generation and the set of local
+  # kegs. Neither can change while both explicit generations match the last
+  # committed stamp, so avoid scanning every local keg on read-only commands.
+  homebrew-overlay-update-base-drift "${prefix}" "${base_key}" || return 1
 
   desired="${state_dir}/view.desired.$$.$RANDOM"
   homebrew-overlay-build-view "${prefix}" "${base_prefix}" "${desired}" || {
@@ -914,8 +1008,8 @@ homebrew-overlay-sync-unlocked() {
   homebrew-overlay-apply-view "${prefix}" "${transaction_desired}" "${state_file}" || return 1
   rm -f -- "${transaction_state}" "${transaction_desired}" || return 1
 
-  # Publication changes the user view key; store the committed generation.
-  local_key="$(homebrew-overlay-view-key "${prefix}")" || return 1
+  # Synchronization changes only inherited view links, not the local package
+  # generation. Store the explicit package generations that produced the view.
   temporary_stamp="${stamp_file}.tmp.$$.$RANDOM"
   printf '%s\n%s\n' "${base_key}" "${local_key}" >"${temporary_stamp}" || return 1
   chmod 0600 "${temporary_stamp}" || {
@@ -954,6 +1048,10 @@ homebrew-overlay-bootstrap() {
   if homebrew-overlay-prefix-writable "${HOMEBREW_PREFIX}" &&
      ! homebrew-overlay-truthy "${HOMEBREW_OVERLAY_FORCE:-}"
   then
+    # Administrator package mutations use this explicit generation to make
+    # developer read-only invocations O(1). Initializing it from the current
+    # native package view preserves the pre-marker generation exactly.
+    homebrew-overlay-ensure-generation "${HOMEBREW_PREFIX}" || return 1
     return 0
   fi
 
@@ -984,8 +1082,17 @@ then
       [[ -d "${base_prefix}/Cellar" && ! -L "${base_prefix}/Cellar" ]] || exit 1
       homebrew-overlay-view-key "${base_prefix}"
       ;;
+    --ensure-generation)
+      prefix="$(homebrew-overlay-normalize-absolute "${2:-${HOMEBREW_PREFIX:-}}")" || exit 1
+      homebrew-overlay-ensure-generation "${prefix}"
+      homebrew-overlay-read-generation "${prefix}"
+      ;;
+    --bump-generation)
+      prefix="$(homebrew-overlay-normalize-absolute "${2:-${HOMEBREW_PREFIX:-}}")" || exit 1
+      homebrew-overlay-bump-generation "${prefix}"
+      ;;
     *)
-      echo "Usage: overlay.sh --sync|--quick-sync|--base-generation" >&2
+      echo "Usage: overlay.sh --sync|--quick-sync|--base-generation|--ensure-generation [prefix]|--bump-generation [prefix]" >&2
       exit 2
       ;;
   esac
