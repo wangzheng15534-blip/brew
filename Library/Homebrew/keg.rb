@@ -5,6 +5,7 @@ require "cachable"
 require "keg_relocate"
 require "language/python"
 require "lock_file"
+require "overlay"
 require "pkg_version"
 require "utils/output"
 
@@ -118,6 +119,14 @@ class Keg
 
     if (path = original_path.realpath)
       until path.root?
+        if Homebrew::Overlay.active?
+          logical_path = Homebrew::Overlay.logical_keg_path(path)
+          if logical_path != path
+            return Keg.new(logical_path) if Homebrew::Overlay.active_prefix_path?(original_path)
+
+            return Keg.new(path)
+          end
+        end
         return Keg.new(path) if path.parent.parent == HOMEBREW_CELLAR.realpath
 
         path = path.parent.realpath # realpath() prevents root? failing
@@ -180,7 +189,7 @@ class Keg
       HOMEBREW_CELLAR,
       HOMEBREW_LOCKS,
       HOMEBREW_LOGS,
-      HOMEBREW_REPOSITORY,
+      *(Homebrew::Overlay.active? ? [] : [HOMEBREW_REPOSITORY]),
       Language::Python.homebrew_site_packages,
     ]).sort.uniq.freeze, T.nilable(T::Array[Pathname]))
   end
@@ -202,7 +211,7 @@ class Keg
   sig { params(path: Pathname).void }
   def initialize(path)
     path = path.resolved_path if path.to_s.start_with?("#{HOMEBREW_PREFIX}/opt/")
-    raise "#{path} is not a valid keg" if path.parent.parent.realpath != HOMEBREW_CELLAR.realpath
+    raise "#{path} is not a valid keg" unless Homebrew::Overlay.valid_keg_path?(path)
     raise "#{path} is not a directory" unless path.directory?
 
     @path = path
@@ -322,6 +331,10 @@ class Keg
 
   sig { params(raise_failures: T::Boolean).void }
   def uninstall(raise_failures: false)
+    if Homebrew::Overlay.inherited_keg?(path)
+      raise Homebrew::Overlay::InheritedKegError.new(path, Homebrew::Overlay.source_prefix_for(path))
+    end
+
     CacheStoreDatabase.use(:linkage) do |db|
       break unless db.created?
 
@@ -336,6 +349,7 @@ class Keg
     remove_linked_keg_record if linked?
     remove_old_aliases
     remove_oldname_opt_records
+    Homebrew::Overlay.restore_inherited_rack!(name)
   rescue Errno::EACCES, Errno::ENOTEMPTY
     raise if raise_failures
 
@@ -744,6 +758,8 @@ class Keg
 
   sig { params(dst: Pathname, src: Pathname, verbose: T::Boolean, dry_run: T::Boolean, overwrite: T::Boolean).void }
   def make_relative_symlink(dst, src, verbose: false, dry_run: false, overwrite: false)
+    Homebrew::Overlay.remove_inherited_prefix_link!(dst) unless dry_run
+
     if dst.symlink? && src == dst.resolved_path
       puts "Skipping; link already exists: #{dst}" if verbose
       return

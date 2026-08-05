@@ -88,6 +88,15 @@ test "$(readlink "${environment_prefix}/opt/foo")" = "../Cellar/foo/2.0"
 test "$(readlink "${environment_prefix}/var/homebrew/linked/foo")" = \
   "${environment_prefix}/Cellar/foo/2.0"
 
+# Homebrew removes empty opt and linked-keg directories during uninstall.
+# A later overlay sync must recreate them before restoring inherited links.
+rm -rf "${environment_prefix}/opt" "${environment_prefix}/var/homebrew/linked"
+homebrew-overlay-sync
+test -d "${environment_prefix}/opt"
+test -d "${environment_prefix}/var/homebrew/linked"
+test -L "${environment_prefix}/opt/baseonly"
+test -L "${environment_prefix}/var/homebrew/linked/baseonly"
+
 # A user replacement must not be removed just because an older manifest listed
 # the same destination with an inherited target.
 replacement="${work}/replacement"

@@ -15,6 +15,7 @@ require "development_tools"
 require "cache_store"
 require "linkage_checker"
 require "messages"
+require "overlay"
 require "cask/caskroom"
 require "cmd/install"
 require "find"
@@ -547,6 +548,7 @@ class FormulaInstaller
 
   sig { void }
   def install
+    overlay_rack_prepared = T.let(false, T::Boolean)
     lock
 
     start_time = Time.now
@@ -582,6 +584,8 @@ class FormulaInstaller
     end
 
     return if only_deps?
+
+    overlay_rack_prepared = Homebrew::Overlay.prepare_formula_install!(formula.name)
 
     formula.deprecated_flags.each do |deprecated_option|
       old_flag = deprecated_option.old_flag
@@ -642,6 +646,9 @@ on_request: installed_on_request?, options:)
     opoo "Nothing was installed to #{formula.prefix}" unless formula.latest_version_installed?
     end_time = Time.now
     Homebrew.messages.package_installed(formula.name, end_time - start_time)
+  rescue Exception # rubocop:disable Lint/RescueException
+    Homebrew::Overlay.restore_inherited_rack!(formula.name) if overlay_rack_prepared
+    raise
   end
 
   sig { void }
@@ -890,8 +897,10 @@ on_request: installed_on_request?, options:)
     if dep_formula.latest_version_installed?
       installed_keg = Keg.new(dep_formula.prefix)
       tab ||= installed_keg.tab
-      tmp_keg = Pathname.new("#{installed_keg}.tmp")
-      installed_keg.rename(tmp_keg) unless tmp_keg.directory?
+      unless Homebrew::Overlay.inherited_keg?(installed_keg.to_path)
+        tmp_keg = Pathname.new("#{installed_keg}.tmp")
+        installed_keg.rename(tmp_keg) unless tmp_keg.directory?
+      end
     end
 
     if dep_formula.tap.present? && tab.present? && (tab_tap = tab.source["tap"].presence) &&
@@ -935,7 +944,7 @@ on_request: installed_on_request?, options:)
   rescue Exception => e # rubocop:disable Lint/RescueException
     ignore_interrupts do
       tmp_keg.rename(installed_keg.to_path) if tmp_keg && !installed_keg.directory?
-      linked_keg.link(verbose: verbose?) if keg_was_linked
+      linked_keg.link(verbose: verbose?) if keg_was_linked && !linked_keg.linked?
     end
     raise unless e.is_a? FormulaInstallationAlreadyAttemptedError
 

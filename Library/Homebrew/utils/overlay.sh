@@ -263,7 +263,10 @@ homebrew-overlay-sync-prefix-links() {
   local temporary_manifest="${manifest}.tmp.$$"
   local parent root source relative destination target_real rack version link_target
 
-  mkdir -p "${manifest%/*}"
+  mkdir -p \
+    "${manifest%/*}" \
+    "${prefix}/opt" \
+    "${prefix}/var/homebrew/linked"
   homebrew-overlay-remove-recorded-links "${prefix}" "${manifest}"
   : >"${temporary_manifest}"
 
