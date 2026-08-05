@@ -1064,11 +1064,19 @@ class Formula
   # The parent of the prefix; the named directory in the Cellar containing all
   # installed versions of this software.
   sig { returns(Pathname) }
-  def rack = HOMEBREW_CELLAR/name
+  def rack = Homebrew::Overlay.install_rack(name) || HOMEBREW_CELLAR/name
 
-  # All currently installed prefix directories.
+  # All currently installed prefix directories. A staged overlay realization
+  # participates in installer queries without replacing the inherited active
+  # version until the transaction publishes it.
   sig { returns(T::Array[Pathname]) }
-  def installed_prefixes = Utils::Path.formula_installed_prefixes(possible_names)
+  def installed_prefixes
+    prefixes = Utils::Path.formula_installed_prefixes(possible_names)
+    if (staging_rack = Homebrew::Overlay.install_rack(name))&.directory?
+      prefixes |= staging_rack.subdirs
+    end
+    prefixes
+  end
 
   # All currently installed kegs.
   sig { returns(T::Array[Keg]) }

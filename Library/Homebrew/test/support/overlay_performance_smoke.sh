@@ -23,16 +23,18 @@ mkdir -p \
   "${user}/share" "${user}/var/homebrew/linked" "${user}/var/homebrew/locks" \
   "${user}/var/homebrew/overlay/transactions" "${user}/var/homebrew/overlay/sync"
 
+formula_paths=()
+ignored_paths=()
 for ((i = 1; i <= formulae; i++))
 do
-  mkdir -p "${base}/Cellar/tool-${i}/1.0/bin"
-  printf '#!/bin/sh\n' >"${base}/Cellar/tool-${i}/1.0/bin/tool-${i}"
-  ln -s "../Cellar/tool-${i}/1.0" "${base}/opt/tool-${i}"
+  formula_paths+=("${base}/Cellar/tool-${i}/1.0")
 done
 for ((i = 1; i <= ignored_entries; i++))
 do
-  mkdir -p "${base}/share/large/group-$((i / 100))/entry-${i}"
+  ignored_paths+=("${base}/share/large/group-$((i / 100))/entry-${i}")
 done
+((${#formula_paths[@]} == 0)) || mkdir -p -- "${formula_paths[@]}"
+((${#ignored_paths[@]} == 0)) || mkdir -p -- "${ignored_paths[@]}"
 
 export HOMEBREW_PREFIX="${user}"
 export HOMEBREW_OVERLAY_BASE_PREFIX="${base}"

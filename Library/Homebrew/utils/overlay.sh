@@ -376,6 +376,10 @@ homebrew-overlay-ensure-parent() {
   then
     parent="${prefix}"
   fi
+  if [[ -d "${parent}" && ! -L "${parent}" && -O "${parent}" && -w "${parent}" ]]
+  then
+    return 0
+  fi
   homebrew-overlay-safe-mkdir "${prefix}" "${parent}"
 }
 
@@ -550,11 +554,58 @@ homebrew-overlay-recover-sync() {
   rm -f -- "${state}" "${desired}" || return 1
 }
 
+homebrew-overlay-remove-version-links() {
+  local prefix="$1"
+  local version_path="$2"
+  local root link resolved listing
+
+  for root in bin sbin include lib share Frameworks opt var/homebrew/linked
+  do
+    [[ -d "${prefix}/${root}" && ! -L "${prefix}/${root}" ]] || continue
+    listing="$(mktemp "${TMPDIR:-/tmp}/homebrew-overlay-links.XXXXXX")" || return 1
+    find "${prefix}/${root}" -type l -print0 >"${listing}" || {
+      rm -f -- "${listing}"
+      return 1
+    }
+    while IFS= read -r -d '' link
+    do
+      resolved="$(readlink -f -- "${link}" 2>/dev/null || true)"
+      if [[ -n "${resolved}" ]] && homebrew-overlay-path-under "${resolved}" "${version_path}"
+      then
+        rm -f -- "${link}" || {
+          rm -f -- "${listing}"
+          return 1
+        }
+      fi
+    done <"${listing}"
+    rm -f -- "${listing}" || return 1
+  done
+}
+
+homebrew-overlay-transaction-marker-id() {
+  local marker="$1"
+  local marker_id=""
+
+  if [[ -e "${marker}" || -L "${marker}" ]]
+  then
+    [[ -f "${marker}" && ! -L "${marker}" ]] || {
+      echo "Error: unsafe overlay formula transaction marker: ${marker}" >&2
+      return 1
+    }
+    IFS= read -r marker_id <"${marker}" || return 1
+    [[ "${marker_id}" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  fi
+  printf '%s\n' "${marker_id}"
+}
+
 homebrew-overlay-recover-formula-transactions() {
   local prefix="$1"
   local base_prefix="$2"
   local transactions="${prefix}/var/homebrew/overlay/transactions"
-  local transaction id formula state local_rack staging_root staging_rack base_rack marker
+  local transaction id formula version state base_rack local_rack final_version
+  local staging_root staging_version replacement_root replacement_rack replacement_version
+  local failed_root failed_rack failed_version final_marker replacement_marker failed_marker
+  local final_marker_id replacement_marker_id failed_marker_id
 
   homebrew-overlay-safe-mkdir "${prefix}" "${transactions}" || return 1
   for transaction in "${transactions}"/*
@@ -568,33 +619,102 @@ homebrew-overlay-recover-formula-transactions() {
     id="${transaction##*/}"
     [[ "${id}" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
     [[ -f "${transaction}/formula" && ! -L "${transaction}/formula" &&
+       -f "${transaction}/version" && ! -L "${transaction}/version" &&
        -f "${transaction}/state" && ! -L "${transaction}/state" ]] || {
       echo "Error: incomplete overlay formula transaction: ${transaction}" >&2
       return 1
     }
     IFS= read -r formula <"${transaction}/formula" || return 1
+    IFS= read -r version <"${transaction}/version" || return 1
     IFS= read -r state <"${transaction}/state" || return 1
     homebrew-overlay-formula-name-valid "${formula}" || return 1
+    homebrew-overlay-valid-relative-path "${version}" || return 1
+    [[ "${version}" != */* ]] || return 1
 
-    local_rack="${prefix}/Cellar/${formula}"
-    staging_root="${prefix}/Cellar/.homebrew-overlay-staging/${id}"
-    staging_rack="${staging_root}/${formula}"
     base_rack="${base_prefix}/Cellar/${formula}"
-    marker="${local_rack}/.brew-overlay-transaction"
+    local_rack="${prefix}/Cellar/${formula}"
+    final_version="${local_rack}/${version}"
+    staging_root="${prefix}/Cellar/.homebrew-overlay-staging/${id}"
+    staging_version="${staging_root}/${formula}/${version}"
+    replacement_root="${prefix}/Cellar/.homebrew-overlay-racks/${id}"
+    replacement_rack="${replacement_root}/${formula}"
+    replacement_version="${replacement_rack}/${version}"
+    failed_root="${prefix}/Cellar/.homebrew-overlay-failed/${id}"
+    failed_rack="${failed_root}/${formula}"
+    failed_version="${failed_rack}/${version}"
+    final_marker="${final_version}/.brew-overlay-transaction"
+    replacement_marker="${replacement_version}/.brew-overlay-transaction"
+    failed_marker="${failed_version}/.brew-overlay-transaction"
+
+    final_marker_id="$(homebrew-overlay-transaction-marker-id "${final_marker}")" || return 1
+    replacement_marker_id="$(homebrew-overlay-transaction-marker-id "${replacement_marker}")" || return 1
+    failed_marker_id="$(homebrew-overlay-transaction-marker-id "${failed_marker}")" || return 1
 
     case "${state}" in
-      committed)
-        [[ -f "${marker}" && ! -L "${marker}" ]] && rm -f -- "${marker}" || true
+      staging)
+        # The active package view was never changed.
         ;;
-      staging | publishing | published | rolling-back)
-        if [[ -d "${local_rack}" && ! -L "${local_rack}" &&
-              -f "${marker}" && ! -L "${marker}" ]] && grep -Fqx -- "${id}" "${marker}"
+      publishing | published | rolling-back)
+        if [[ "${final_marker_id}" == "${id}" ]]
         then
-          rm -rf --one-file-system -- "${local_rack}" || return 1
-        elif [[ -e "${local_rack}" && ! -L "${local_rack}" ]]
+          [[ -e "${replacement_rack}" || -L "${replacement_rack}" ]] || {
+            echo "Error: transaction ${id} has no previous rack to restore" >&2
+            return 1
+          }
+          homebrew-overlay-remove-version-links "${prefix}" "${final_version}" || return 1
+          homebrew-overlay-atomic-write "${transaction}/state" 0600 <<<'recovering-current' || return 1
+          homebrew-overlay-safe-mkdir "${prefix}" "${failed_root}" || return 1
+          [[ ! -e "${failed_rack}" && ! -L "${failed_rack}" ]] || return 1
+          mv -T -- "${local_rack}" "${failed_rack}" || return 1
+          homebrew-overlay-atomic-write "${transaction}/state" 0600 <<<'recovering-previous' || return 1
+          mv -T -- "${replacement_rack}" "${local_rack}" || return 1
+          homebrew-overlay-atomic-write "${transaction}/state" 0600 <<<'recovering-cleanup' || return 1
+        elif [[ "${replacement_marker_id}" == "${id}" ]]
         then
-          echo "Error: refusing to recover transaction ${id}; rack is not transaction-owned: ${local_rack}" >&2
+          # Publication never exchanged the rack, or rollback already did.
+          :
+        else
+          echo "Error: transaction ${id} does not own either recovery rack" >&2
           return 1
+        fi
+        ;;
+      recovering-current | recovering-previous | recovering-cleanup)
+        if [[ "${final_marker_id}" == "${id}" ]]
+        then
+          homebrew-overlay-remove-version-links "${prefix}" "${final_version}" || return 1
+          homebrew-overlay-safe-mkdir "${prefix}" "${failed_root}" || return 1
+          [[ ! -e "${failed_rack}" && ! -L "${failed_rack}" ]] || return 1
+          mv -T -- "${local_rack}" "${failed_rack}" || return 1
+          homebrew-overlay-atomic-write "${transaction}/state" 0600 <<<'recovering-previous' || return 1
+          final_marker_id=""
+          failed_marker_id="${id}"
+        fi
+        if [[ "${failed_marker_id}" == "${id}" && ! -e "${local_rack}" && ! -L "${local_rack}" ]]
+        then
+          [[ -e "${replacement_rack}" || -L "${replacement_rack}" ]] || return 1
+          mv -T -- "${replacement_rack}" "${local_rack}" || return 1
+          homebrew-overlay-atomic-write "${transaction}/state" 0600 <<<'recovering-cleanup' || return 1
+        fi
+        if [[ "${failed_marker_id}" != "${id}" ]]
+        then
+          echo "Error: transaction ${id} has no failed rack to clean" >&2
+          return 1
+        fi
+        ;;
+      committing | committed)
+        # Commit is the durability boundary: keep the published local rack.
+        [[ -d "${local_rack}" && ! -L "${local_rack}" &&
+           -d "${final_version}" && ! -L "${final_version}" ]] || {
+          echo "Error: committed overlay formula rack is missing: ${local_rack}" >&2
+          return 1
+        }
+        if [[ -n "${final_marker_id}" && "${final_marker_id}" != "${id}" ]]
+        then
+          echo "Error: committed overlay formula rack has another transaction marker: ${local_rack}" >&2
+          return 1
+        elif [[ "${final_marker_id}" == "${id}" ]]
+        then
+          rm -f -- "${final_marker}" || return 1
         fi
         ;;
       *)
@@ -603,13 +723,28 @@ homebrew-overlay-recover-formula-transactions() {
         ;;
     esac
 
-    if [[ ! -e "${local_rack}" && ! -L "${local_rack}" && -d "${base_rack}" && ! -L "${base_rack}" ]]
+    # A restored rack must be either the exact administrator rack link or a
+    # real inherited-version union. Never invent a replacement for a missing
+    # administrator rack during recovery.
+    if [[ "${state}" != committing && "${state}" != committed ]]
     then
-      ln -s -- "${base_rack}" "${local_rack}" || return 1
+      [[ -d "${base_rack}" && ! -L "${base_rack}" ]] || {
+        echo "Error: administrator rack disappeared during overlay recovery: ${base_rack}" >&2
+        return 1
+      }
+      [[ -e "${local_rack}" || -L "${local_rack}" ]] || {
+        ln -s -- "${base_rack}" "${local_rack}" || return 1
+      }
     fi
-    homebrew-overlay-path-under "${staging_rack}" "${prefix}/Cellar/.homebrew-overlay-staging" || return 1
-    rm -rf --one-file-system -- "${staging_root}" "${transaction}" || return 1
+
+    homebrew-overlay-path-under "${staging_root}" "${prefix}/Cellar/.homebrew-overlay-staging" || return 1
+    homebrew-overlay-path-under "${replacement_root}" "${prefix}/Cellar/.homebrew-overlay-racks" || return 1
+    homebrew-overlay-path-under "${failed_root}" "${prefix}/Cellar/.homebrew-overlay-failed" || return 1
+    rm -rf --one-file-system -- "${staging_root}" "${replacement_root}" "${failed_root}" "${transaction}" || return 1
   done
+  rmdir "${prefix}/Cellar/.homebrew-overlay-staging" \
+        "${prefix}/Cellar/.homebrew-overlay-racks" \
+        "${prefix}/Cellar/.homebrew-overlay-failed" 2>/dev/null || true
 }
 
 homebrew-overlay-sync-unlocked() {

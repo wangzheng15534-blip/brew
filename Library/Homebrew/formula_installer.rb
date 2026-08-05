@@ -150,6 +150,8 @@ class FormulaInstaller
     @api_bottle = T.let(nil, T.nilable(Bottle))
     @api_bottle_loaded = T.let(false, T::Boolean)
     @enqueued_bottle_download = T.let(nil, T.nilable(Downloadable))
+    @overlay_transaction = T.let(nil, T.nilable(Homebrew::Overlay::FormulaTransaction))
+    @overlay_previous_failed = T.let(nil, T.nilable(T::Boolean))
 
     # Take the original formula instance, which might have been swapped from an API instance to a source instance
     @formula = T.let(T.must(previously_fetched_formula), Formula) if previously_fetched_formula
@@ -548,7 +550,6 @@ class FormulaInstaller
 
   sig { void }
   def install
-    overlay_rack_prepared = T.let(false, T::Boolean)
     lock
 
     start_time = Time.now
@@ -585,7 +586,11 @@ class FormulaInstaller
 
     return if only_deps?
 
-    overlay_rack_prepared = Homebrew::Overlay.prepare_formula_install!(formula.name)
+    @overlay_transaction = Homebrew::Overlay.begin_formula_transaction(formula)
+    if @overlay_transaction
+      @overlay_previous_failed = Homebrew.failed?
+      Homebrew.failed = false
+    end
 
     formula.deprecated_flags.each do |deprecated_option|
       old_flag = deprecated_option.old_flag
@@ -644,10 +649,12 @@ on_request: installed_on_request?, options:)
     build_bottle_postinstall if build_bottle?
 
     opoo "Nothing was installed to #{formula.prefix}" unless formula.latest_version_installed?
+    raise_overlay_transaction_failure! if @overlay_transaction
     end_time = Time.now
     Homebrew.messages.package_installed(formula.name, end_time - start_time)
   rescue Exception # rubocop:disable Lint/RescueException
-    Homebrew::Overlay.rollback_formula_install!(formula.name) if overlay_rack_prepared
+    @overlay_transaction&.rollback!
+    restore_overlay_failure_scope!
     raise
   end
 
@@ -944,7 +951,13 @@ on_request: installed_on_request?, options:)
   rescue Exception => e # rubocop:disable Lint/RescueException
     ignore_interrupts do
       tmp_keg.rename(installed_keg.to_path) if tmp_keg && !installed_keg.directory?
-      linked_keg.link(verbose: verbose?) if keg_was_linked && !linked_keg.linked?
+      if keg_was_linked && !linked_keg.linked?
+        if Homebrew::Overlay.inherited_keg?(linked_keg.to_path)
+          Homebrew::Overlay.sync!
+        else
+          linked_keg.link(verbose: verbose?)
+        end
+      end
     end
     raise unless e.is_a? FormulaInstallationAlreadyAttemptedError
 
@@ -994,22 +1007,44 @@ on_request: installed_on_request?, options:)
   end
 
   sig { void }
+  def raise_overlay_transaction_failure!
+    return unless @overlay_transaction && Homebrew.failed?
+
+    raise Homebrew::Overlay::TransactionFailure,
+          "#{formula.full_name} failed while replacing an inherited formula; the base version was restored"
+  end
+
+  sig { void }
+  def restore_overlay_failure_scope!
+    previous_failed = @overlay_previous_failed
+    return if previous_failed.nil?
+
+    Homebrew.failed = previous_failed || Homebrew.failed?
+    @overlay_previous_failed = nil
+  end
+
+  sig { void }
   def finish
     return if only_deps?
 
     ohai "Finishing up" if verbose?
 
+    @overlay_transaction&.publish!
     keg = Keg.new(formula.prefix)
     link(keg)
+    raise_overlay_transaction_failure!
     warning = link_manual_command_warning
     opoo warning if !quiet? && warning.present?
 
     install_service
+    raise_overlay_transaction_failure!
 
     fix_dynamic_linkage(keg) if !@poured_bottle || !formula.bottle_specification.skip_relocation?(tab: keg.tab)
+    raise_overlay_transaction_failure!
 
     require "install"
     Homebrew::Install.global_post_install
+    raise_overlay_transaction_failure!
 
     if build_bottle? || skip_post_install?
       unless quiet?
@@ -1025,6 +1060,7 @@ on_request: installed_on_request?, options:)
       formula.install_etc_var
       post_install if formula.post_install_steps_defined? || formula.post_install_defined?
     end
+    raise_overlay_transaction_failure!
 
     keg.prepare_debug_symbols if debug_symbols?
 
@@ -1077,13 +1113,19 @@ on_request: installed_on_request?, options:)
       Utils::Curl.clear_path_cache
     end
 
+    raise_overlay_transaction_failure!
+    @overlay_transaction&.commit!
+    self.class.installed << formula
+
     caveats
 
     ohai "Summary" if verbose? || show_summary_heading?
     puts summary
-
-    self.class.installed << formula
+  rescue Exception # rubocop:disable Lint/RescueException
+    @overlay_transaction&.rollback!
+    raise
   ensure
+    restore_overlay_failure_scope!
     unlock
   end
 
