@@ -43,6 +43,7 @@ RSpec.describe Homebrew::Overlay do
     expect(user_cellar/"foo").to be_a_directory
     expect(user_cellar/"foo").not_to be_a_symlink
     expect(base_keg).to exist
+    expect(described_class).to have_received(:sync!)
   end
 
   it "restores the base rack when the local rack becomes empty" do

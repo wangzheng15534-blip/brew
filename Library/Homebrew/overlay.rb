@@ -115,6 +115,7 @@ module Homebrew
       rack.unlink
       rack.mkpath
       clear_caches!
+      sync!
       true
     end
 

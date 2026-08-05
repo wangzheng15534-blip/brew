@@ -349,7 +349,8 @@ class Keg
     remove_linked_keg_record if linked?
     remove_old_aliases
     remove_oldname_opt_records
-    Homebrew::Overlay.restore_inherited_rack!(name)
+    restored_inherited_rack = Homebrew::Overlay.restore_inherited_rack!(name)
+    Homebrew::Overlay.sync! if Homebrew::Overlay.active? && !restored_inherited_rack
   rescue Errno::EACCES, Errno::ENOTEMPTY
     raise if raise_failures
 

@@ -102,7 +102,7 @@ module Homebrew
       rescue Exception # rubocop:disable Lint/RescueException
         ignore_interrupts do
           if inherited_keg
-            Homebrew::Overlay.sync!
+            Homebrew::Overlay.rollback_formula_install!(formula.name)
           elsif keg
             restore_backup(keg, link_keg, verbose:)
           end
