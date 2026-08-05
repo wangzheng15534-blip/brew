@@ -86,6 +86,7 @@ module Homebrew
         link_keg = install_context.link_keg
         verbose = formula_installer.verbose?
         inherited_keg = T.let(!keg.nil? && Homebrew::Overlay.inherited_keg?(keg.to_path), T::Boolean)
+        formula_install_completed = T.let(false, T::Boolean)
 
         formula_installer.check_installation_already_attempted
 
@@ -95,6 +96,7 @@ module Homebrew
           inherited_keg ? keg.unlink : backup(keg)
         end
         formula_installer.install
+        formula_install_completed = true
         formula_installer.finish
       rescue FormulaInstallationAlreadyAttemptedError
         nil
@@ -102,7 +104,14 @@ module Homebrew
       rescue Exception # rubocop:disable Lint/RescueException
         ignore_interrupts do
           if inherited_keg
-            Homebrew::Overlay.rollback_formula_install!(formula.name)
+            if formula_install_completed
+              Homebrew::Overlay.rollback_formula_install!(formula.name)
+            else
+              # FormulaInstaller rolls back a prepared rack itself. If it
+              # failed before preparation, reinstall has still unlinked the
+              # inherited keg, so rebuild the inherited prefix links.
+              Homebrew::Overlay.sync!
+            end
           elsif keg
             restore_backup(keg, link_keg, verbose:)
           end

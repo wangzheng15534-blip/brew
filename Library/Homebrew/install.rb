@@ -741,6 +741,7 @@ module Homebrew
       def install_formula(formula_installer, upgrade:)
         formula = formula_installer.formula
         inherited_upgrade = T.let(false, T::Boolean)
+        formula_install_completed = T.let(false, T::Boolean)
 
         formula_installer.check_installation_already_attempted
 
@@ -760,13 +761,16 @@ module Homebrew
         kegs.each(&:unlink) if kegs.present?
 
         formula_installer.install
+        formula_install_completed = true
         formula_installer.finish
       rescue FormulaInstallationAlreadyAttemptedError
         # We already attempted to upgrade f as part of the dependency tree of
         # another formula. In that case, don't generate an error, just move on.
         nil
       rescue Exception # rubocop:disable Lint/RescueException
-        Homebrew::Overlay.rollback_formula_install!(formula.name) if inherited_upgrade
+        if inherited_upgrade && formula_install_completed
+          Homebrew::Overlay.rollback_formula_install!(formula.name)
+        end
         raise
       ensure
         # restore previous installation state if build failed
