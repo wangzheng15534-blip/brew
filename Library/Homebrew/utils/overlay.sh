@@ -58,6 +58,10 @@ homebrew-overlay-formula-name-valid() {
   [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9@+._-]*$ ]]
 }
 
+homebrew-overlay-base-generation-valid() {
+  [[ "$1" =~ ^[0-9a-f]{64}$ ]]
+}
+
 homebrew-overlay-prefix-owned-and-writable() {
   local prefix="$1"
   local owner
@@ -529,6 +533,90 @@ homebrew-overlay-view-key() {
   rm -f -- "${listing}"
 }
 
+homebrew-overlay-update-base-drift() {
+  local prefix="$1"
+  local base_key="$2"
+  local state_dir="${prefix}/var/homebrew/overlay"
+  local state_file="${state_dir}/base-drift.state"
+  local warned_file="${state_dir}/base-drift.warned"
+  local temporary="${state_file}.tmp.$$.$RANDOM"
+  local rack version formula_name version_name marker recorded relative warning_key old_warning=""
+
+  homebrew-overlay-base-generation-valid "${base_key}" || return 1
+  homebrew-overlay-safe-mkdir "${prefix}" "${state_dir}" || return 1
+  for marker in "${state_file}" "${warned_file}"
+  do
+    if [[ -L "${marker}" || ( -e "${marker}" && ! -f "${marker}" ) ]]
+    then
+      echo "Error: unsafe base-generation drift state: ${marker}" >&2
+      return 1
+    fi
+  done
+  : >"${temporary}" || return 1
+  for rack in "${prefix}/Cellar"/*
+  do
+    [[ -d "${rack}" && ! -L "${rack}" ]] || continue
+    formula_name="${rack##*/}"
+    [[ "${formula_name}" != .* ]] || continue
+    homebrew-overlay-formula-name-valid "${formula_name}" || continue
+    for version in "${rack}"/*
+    do
+      [[ -d "${version}" && ! -L "${version}" ]] || continue
+      version_name="${version##*/}"
+      [[ "${version_name}" != .* ]] || continue
+      homebrew-overlay-valid-relative-path "${version_name}" || return 1
+      [[ "${version_name}" != */* ]] || return 1
+      marker="${version}/.brew-overlay-base-generation"
+      recorded="missing"
+      if [[ -e "${marker}" || -L "${marker}" ]]
+      then
+        [[ -f "${marker}" && ! -L "${marker}" ]] || {
+          rm -f -- "${temporary}"
+          echo "Error: unsafe base-generation marker: ${marker}" >&2
+          return 1
+        }
+        IFS= read -r recorded <"${marker}" || {
+          rm -f -- "${temporary}"
+          return 1
+        }
+        homebrew-overlay-base-generation-valid "${recorded}" || recorded="invalid"
+      fi
+      if [[ "${recorded}" != "${base_key}" ]]
+      then
+        relative="Cellar/${formula_name}/${version_name}"
+        homebrew-overlay-valid-relative-path "${relative}" || {
+          rm -f -- "${temporary}"
+          return 1
+        }
+        printf '%s\0%s\0' "${relative}" "${recorded}" >>"${temporary}" || {
+          rm -f -- "${temporary}"
+          return 1
+        }
+      fi
+    done
+  done
+
+  chmod 0600 "${temporary}" || {
+    rm -f -- "${temporary}"
+    return 1
+  }
+  mv -fT -- "${temporary}" "${state_file}" || return 1
+
+  if [[ -s "${state_file}" ]]
+  then
+    warning_key="${base_key}:$(sha256sum "${state_file}" | awk '{print $1}')" || return 1
+    [[ -f "${warned_file}" ]] && IFS= read -r old_warning <"${warned_file}" || true
+    if [[ "${warning_key}" != "${old_warning}" ]]
+    then
+      echo "Warning: the administrator Homebrew base changed after local formulae were built." >&2
+      echo "Run 'brew doctor' and reinstall the reported local formulae before relying on them." >&2
+      homebrew-overlay-atomic-write "${warned_file}" 0600 <<<"${warning_key}" || return 1
+    fi
+  else
+    rm -f -- "${state_file}" "${warned_file}" || return 1
+  fi
+}
+
 homebrew-overlay-sync-transaction-dir() {
   printf '%s\n' "${HOMEBREW_PREFIX}/var/homebrew/overlay/sync"
 }
@@ -602,10 +690,10 @@ homebrew-overlay-recover-formula-transactions() {
   local prefix="$1"
   local base_prefix="$2"
   local transactions="${prefix}/var/homebrew/overlay/transactions"
-  local transaction id formula version state base_rack local_rack final_version
+  local transaction id formula version state base_generation base_rack local_rack final_version
   local staging_root staging_version replacement_root replacement_rack replacement_version
   local failed_root failed_rack failed_version final_marker replacement_marker failed_marker
-  local final_marker_id replacement_marker_id failed_marker_id
+  local base_generation_marker recorded_generation final_marker_id replacement_marker_id failed_marker_id
 
   homebrew-overlay-safe-mkdir "${prefix}" "${transactions}" || return 1
   for transaction in "${transactions}"/*
@@ -620,16 +708,19 @@ homebrew-overlay-recover-formula-transactions() {
     [[ "${id}" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
     [[ -f "${transaction}/formula" && ! -L "${transaction}/formula" &&
        -f "${transaction}/version" && ! -L "${transaction}/version" &&
+       -f "${transaction}/base_generation" && ! -L "${transaction}/base_generation" &&
        -f "${transaction}/state" && ! -L "${transaction}/state" ]] || {
       echo "Error: incomplete overlay formula transaction: ${transaction}" >&2
       return 1
     }
     IFS= read -r formula <"${transaction}/formula" || return 1
     IFS= read -r version <"${transaction}/version" || return 1
+    IFS= read -r base_generation <"${transaction}/base_generation" || return 1
     IFS= read -r state <"${transaction}/state" || return 1
     homebrew-overlay-formula-name-valid "${formula}" || return 1
     homebrew-overlay-valid-relative-path "${version}" || return 1
     [[ "${version}" != */* ]] || return 1
+    homebrew-overlay-base-generation-valid "${base_generation}" || return 1
 
     base_rack="${base_prefix}/Cellar/${formula}"
     local_rack="${prefix}/Cellar/${formula}"
@@ -645,6 +736,7 @@ homebrew-overlay-recover-formula-transactions() {
     final_marker="${final_version}/.brew-overlay-transaction"
     replacement_marker="${replacement_version}/.brew-overlay-transaction"
     failed_marker="${failed_version}/.brew-overlay-transaction"
+    base_generation_marker="${final_version}/.brew-overlay-base-generation"
 
     final_marker_id="$(homebrew-overlay-transaction-marker-id "${final_marker}")" || return 1
     replacement_marker_id="$(homebrew-overlay-transaction-marker-id "${replacement_marker}")" || return 1
@@ -702,12 +794,23 @@ homebrew-overlay-recover-formula-transactions() {
         fi
         ;;
       committing | committed)
-        # Commit is the durability boundary: keep the published local rack.
+        # Commit is the durability boundary: keep the published local rack only
+        # when it carries the exact lower-prefix generation from the journal.
         [[ -d "${local_rack}" && ! -L "${local_rack}" &&
            -d "${final_version}" && ! -L "${final_version}" ]] || {
           echo "Error: committed overlay formula rack is missing: ${local_rack}" >&2
           return 1
         }
+        [[ -f "${base_generation_marker}" && ! -L "${base_generation_marker}" ]] || {
+          echo "Error: committed overlay formula has no safe base-generation marker: ${final_version}" >&2
+          return 1
+        }
+        IFS= read -r recorded_generation <"${base_generation_marker}" || return 1
+        if [[ "${recorded_generation}" != "${base_generation}" ]]
+        then
+          echo "Error: committed overlay formula has the wrong base generation: ${final_version}" >&2
+          return 1
+        fi
         if [[ -n "${final_marker_id}" && "${final_marker_id}" != "${id}" ]]
         then
           echo "Error: committed overlay formula rack has another transaction marker: ${local_rack}" >&2
@@ -775,6 +878,7 @@ homebrew-overlay-sync-unlocked() {
   homebrew-overlay-recover-sync "${prefix}" || return 1
 
   base_key="$(homebrew-overlay-view-key "${base_prefix}")" || return 1
+  homebrew-overlay-update-base-drift "${prefix}" "${base_key}" || return 1
   local_key="$(homebrew-overlay-view-key "${prefix}")" || return 1
   if [[ "${force}" -eq 0 && -f "${stamp_file}" && ! -L "${stamp_file}" &&
         -f "${state_file}" && ! -L "${state_file}" ]]
@@ -875,8 +979,13 @@ then
     --quick-sync)
       homebrew-overlay-sync
       ;;
+    --base-generation)
+      base_prefix="$(homebrew-overlay-normalize-absolute         "$(homebrew-overlay-expand-home "${HOMEBREW_OVERLAY_BASE_PREFIX:-}")")" || exit 1
+      [[ -d "${base_prefix}/Cellar" && ! -L "${base_prefix}/Cellar" ]] || exit 1
+      homebrew-overlay-view-key "${base_prefix}"
+      ;;
     *)
-      echo "Usage: overlay.sh --sync|--quick-sync" >&2
+      echo "Usage: overlay.sh --sync|--quick-sync|--base-generation" >&2
       exit 2
       ;;
   esac

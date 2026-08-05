@@ -502,8 +502,9 @@ module Homebrew
         base_prefix = Homebrew::Overlay.base_prefix
         base_cellar = Homebrew::Overlay.base_cellar
 
-        unless base_prefix.directory? && !base_prefix.symlink? &&
-               base_cellar.directory? && !base_cellar.symlink? && base_cellar.readable?
+        base_safe = base_prefix.directory? && !base_prefix.symlink? &&
+                    base_cellar.directory? && !base_cellar.symlink? && base_cellar.readable?
+        unless base_safe
           findings << Finding.new(
             <<~EOS,
               The administrator Homebrew base is unavailable or unsafe:
@@ -553,6 +554,23 @@ module Homebrew
             EOS
             tier:        :unsupported,
             remediation: "Remove the unsafe state entry and rerun brew so the package view can be regenerated.",
+          )
+        end
+
+        if base_safe && cellar_safe && (drift = Homebrew::Overlay.base_generation_drift).any?
+          displayed = drift.first(20).map { |keg| "  #{keg}" }
+          displayed << "  ... and #{drift.length - 20} more" if drift.length > 20
+          formulae = drift.map { |keg| keg.parent.basename.to_s }.uniq.sort
+          findings << Finding.new(
+            <<~EOS,
+              Local formulae were built against a different administrator base generation:
+              #{displayed.join("\n")}
+            EOS
+            tier: :unsupported,
+            remediation: <<~EOS,
+              Reinstall the affected local formulae after the administrator base update finishes:
+                brew reinstall #{formulae.join(" ")}
+            EOS
           )
         end
 

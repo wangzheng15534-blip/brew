@@ -151,6 +151,9 @@ class FormulaInstaller
     @api_bottle_loaded = T.let(false, T::Boolean)
     @enqueued_bottle_download = T.let(nil, T.nilable(Downloadable))
     @overlay_transaction = T.let(nil, T.nilable(Homebrew::Overlay::FormulaTransaction))
+    @overlay_base_generation = T.let(nil, T.nilable(String))
+    @overlay_local_keg_preexisting = T.let(false, T::Boolean)
+    @overlay_local_keg_committed = T.let(false, T::Boolean)
     @overlay_previous_failed = T.let(nil, T.nilable(T::Boolean))
 
     # Take the original formula instance, which might have been swapped from an API instance to a source instance
@@ -586,7 +589,20 @@ class FormulaInstaller
 
     return if only_deps?
 
-    @overlay_transaction = Homebrew::Overlay.begin_formula_transaction(formula)
+    if Homebrew::Overlay.active?
+      @overlay_local_keg_preexisting = Homebrew::Overlay.local_keg_realization?(
+        formula.name,
+        formula.pkg_version.to_s,
+      )
+      @overlay_base_generation = Homebrew::Overlay.current_base_generation
+      @overlay_transaction = Homebrew::Overlay.begin_formula_transaction(
+        formula,
+        base_generation: T.must(@overlay_base_generation),
+      )
+      unless @overlay_transaction
+        Homebrew::Overlay.validate_local_install_target!(formula.name, formula.pkg_version.to_s)
+      end
+    end
     if @overlay_transaction
       @overlay_previous_failed = Homebrew.failed?
       Homebrew.failed = false
@@ -649,11 +665,13 @@ on_request: installed_on_request?, options:)
     build_bottle_postinstall if build_bottle?
 
     opoo "Nothing was installed to #{formula.prefix}" unless formula.latest_version_installed?
+    verify_overlay_base_generation!
     raise_overlay_transaction_failure! if @overlay_transaction
     end_time = Time.now
     Homebrew.messages.package_installed(formula.name, end_time - start_time)
   rescue Exception # rubocop:disable Lint/RescueException
     @overlay_transaction&.rollback!
+    rollback_overlay_uncommitted_local_keg!
     restore_overlay_failure_scope!
     raise
   end
@@ -1007,11 +1025,27 @@ on_request: installed_on_request?, options:)
   end
 
   sig { void }
+  def verify_overlay_base_generation!
+    generation = @overlay_base_generation
+    Homebrew::Overlay.verify_base_generation!(generation) if generation
+  end
+
+  sig { void }
   def raise_overlay_transaction_failure!
+    verify_overlay_base_generation!
     return unless @overlay_transaction && Homebrew.failed?
 
     raise Homebrew::Overlay::TransactionFailure,
           "#{formula.full_name} failed while replacing an inherited formula; the base version was restored"
+  end
+
+  sig { void }
+  def rollback_overlay_uncommitted_local_keg!
+    return unless Homebrew::Overlay.active?
+    return if @overlay_transaction || @overlay_local_keg_preexisting || @overlay_local_keg_committed
+    return if @overlay_base_generation.nil?
+
+    Homebrew::Overlay.discard_local_keg!(formula.name, formula.pkg_version.to_s)
   end
 
   sig { void }
@@ -1029,6 +1063,7 @@ on_request: installed_on_request?, options:)
 
     ohai "Finishing up" if verbose?
 
+    verify_overlay_base_generation!
     @overlay_transaction&.publish!
     keg = Keg.new(formula.prefix)
     link(keg)
@@ -1114,7 +1149,14 @@ on_request: installed_on_request?, options:)
     end
 
     raise_overlay_transaction_failure!
-    @overlay_transaction&.commit!
+    if @overlay_transaction
+      @overlay_transaction.commit!
+    elsif (generation = @overlay_base_generation)
+      Homebrew::Overlay.verify_base_generation!(generation)
+      Homebrew::Overlay.record_base_generation!(keg.to_path, generation)
+      Homebrew::Overlay.verify_base_generation!(generation)
+      @overlay_local_keg_committed = true
+    end
     self.class.installed << formula
 
     caveats
@@ -1123,6 +1165,7 @@ on_request: installed_on_request?, options:)
     puts summary
   rescue Exception # rubocop:disable Lint/RescueException
     @overlay_transaction&.rollback!
+    rollback_overlay_uncommitted_local_keg!
     raise
   ensure
     restore_overlay_failure_scope!

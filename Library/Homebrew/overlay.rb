@@ -6,6 +6,7 @@ require "fileutils"
 require "fiddle"
 require "rbconfig"
 require "securerandom"
+require "utils/popen"
 
 module Homebrew
   # Helpers for the optional non-service package overlay. The active prefix is
@@ -33,7 +34,23 @@ module Homebrew
 
     class TransactionFailure < RuntimeError; end
 
+    class BaseGenerationChangedError < TransactionFailure
+      extend T::Sig
+
+      sig { params(expected: String, actual: String).void }
+      def initialize(expected, actual)
+        super <<~EOS
+          The administrator Homebrew base changed during this install.
+            expected generation: #{expected}
+            current generation:  #{actual}
+          The local formula was not committed. Retry after the administrator update finishes.
+        EOS
+      end
+    end
+
     TRANSACTION_MARKER = ".brew-overlay-transaction"
+    BASE_GENERATION_MARKER = ".brew-overlay-base-generation"
+    BASE_GENERATION_PATTERN = /\A[0-9a-f]{64}\z/
     AT_FDCWD = -100
     RENAME_EXCHANGE = 2
     RENAMEAT2_SYSCALLS = T.let(
@@ -82,12 +99,17 @@ module Homebrew
       sig { returns(Pathname) }
       attr_reader :final_version
 
-      sig { params(formula: T.untyped).void }
-      def initialize(formula)
+      sig { returns(String) }
+      attr_reader :base_generation
+
+      sig { params(formula: T.untyped, base_generation: String).void }
+      def initialize(formula, base_generation:)
         @formula_name = T.let(formula.name, String)
         @version = T.let(formula.pkg_version.to_s, String)
+        @base_generation = T.let(base_generation, String)
         raise ArgumentError, "invalid formula name: #{@formula_name}" unless Overlay.valid_formula_name?(@formula_name)
         raise ArgumentError, "invalid formula version: #{@version}" unless Overlay.valid_version_name?(@version)
+        Overlay.validate_base_generation!(@base_generation)
 
         @id = T.let("#{Process.pid}-#{SecureRandom.hex(12)}", String)
         @transaction_dir = T.let(Overlay.transactions_dir/@id, Pathname)
@@ -106,6 +128,7 @@ module Homebrew
       def start!
         raise "overlay transaction already exists: #{transaction_dir}" if transaction_dir.exist?
 
+        Overlay.verify_base_generation!(base_generation)
         Overlay.ensure_inherited_rack!(formula_name)
         transaction_dir.mkpath
         transaction_dir.chmod 0700
@@ -113,6 +136,7 @@ module Homebrew
         staging_rack.chmod 0700
         write_metadata("formula", formula_name)
         write_metadata("version", version)
+        write_metadata("base_generation", base_generation)
         write_state("staging")
         Overlay.register_transaction(self)
         self
@@ -129,8 +153,10 @@ module Homebrew
           raise TransactionFailure, "staged formula version is missing or empty: #{staging_version}"
         end
 
+        Overlay.verify_base_generation!(base_generation)
         relocate_staging_prefix!
         prepare_replacement_rack!
+        Overlay.verify_base_generation!(base_generation)
         write_state("publishing")
         Overlay.atomic_exchange!(final_rack, replacement_rack)
         write_state("published")
@@ -147,6 +173,9 @@ module Homebrew
         return if @finished
         raise TransactionFailure, "overlay transaction was not published" unless transaction_owns_final?
 
+        Overlay.verify_base_generation!(base_generation)
+        Overlay.record_base_generation!(final_version, base_generation)
+        Overlay.verify_base_generation!(base_generation)
         write_state("committing")
         marker = final_version/TRANSACTION_MARKER
         marker.unlink
@@ -295,7 +324,7 @@ module Homebrew
       end
     end
 
-    private_constant :TRANSACTION_MARKER, :AT_FDCWD, :RENAME_EXCHANGE, :RENAMEAT2_SYSCALLS
+    private_constant :TRANSACTION_MARKER, :BASE_GENERATION_PATTERN, :AT_FDCWD, :RENAME_EXCHANGE, :RENAMEAT2_SYSCALLS
 
     sig { returns(T::Boolean) }
     def self.active?
@@ -382,6 +411,34 @@ module Homebrew
       active? && inherited_path?(keg_path)
     end
 
+    sig { params(formula_name: String, version: String).returns(T::Boolean) }
+    def self.inherited_install_target?(formula_name, version)
+      return false unless active? && valid_formula_name?(formula_name) && valid_version_name?(version)
+
+      rack = HOMEBREW_CELLAR/formula_name
+      keg = rack/version
+      rack.directory? && !rack.symlink? && keg.symlink? && inherited_keg?(keg)
+    end
+
+    sig { params(formula_name: String, version: String).void }
+    def self.validate_local_install_target!(formula_name, version)
+      return unless inherited_install_target?(formula_name, version)
+
+      raise TransactionFailure, <<~EOS
+        #{HOMEBREW_CELLAR/formula_name/version} is an inherited administrator version inside a local version-union rack.
+        Refusing to install through that symlink. Remove the local override for #{formula_name}, then retry the install.
+      EOS
+    end
+
+    sig { params(formula_name: String, version: String).returns(T::Boolean) }
+    def self.local_keg_realization?(formula_name, version)
+      return false unless active? && valid_formula_name?(formula_name) && valid_version_name?(version)
+
+      rack = HOMEBREW_CELLAR/formula_name
+      keg = rack/version
+      rack.directory? && !rack.symlink? && keg.directory? && !keg.symlink?
+    end
+
     sig { params(formula_name: String).returns(T::Boolean) }
     def self.local_realizations?(formula_name)
       rack = HOMEBREW_CELLAR/formula_name
@@ -431,11 +488,89 @@ module Homebrew
       base_rack.directory? && !base_rack.symlink? && !local_realizations?(formula.name)
     end
 
-    sig { params(formula: T.untyped).returns(T.nilable(FormulaTransaction)) }
-    def self.begin_formula_transaction(formula)
+    sig do
+      params(formula: T.untyped, base_generation: String)
+        .returns(T.nilable(FormulaTransaction))
+    end
+    def self.begin_formula_transaction(formula, base_generation:)
       return unless transaction_required?(formula)
 
-      FormulaTransaction.new(formula).start!
+      FormulaTransaction.new(formula, base_generation:).start!
+    end
+
+    sig { params(generation: String).void }
+    def self.validate_base_generation!(generation)
+      return if generation.match?(BASE_GENERATION_PATTERN)
+
+      raise TransactionFailure, "invalid administrator base generation: #{generation.inspect}"
+    end
+
+    sig { returns(String) }
+    def self.current_base_generation
+      raise TransactionFailure, "administrator base generation is unavailable outside an active overlay" unless active?
+
+      script = HOMEBREW_LIBRARY_PATH/"utils/overlay.sh"
+      generation = Utils.safe_popen_read(
+        { "HOMEBREW_OVERLAY_BASE_PREFIX" => base_prefix.to_s },
+        "/bin/bash", script.to_s, "--base-generation", err: :close
+      ).strip
+      validate_base_generation!(generation)
+      generation
+    rescue ErrorDuringExecution, SystemCallError => e
+      raise TransactionFailure, "could not determine administrator base generation: #{e}"
+    end
+
+    sig { params(expected: String).void }
+    def self.verify_base_generation!(expected)
+      validate_base_generation!(expected)
+      actual = current_base_generation
+      raise BaseGenerationChangedError.new(expected, actual) if actual != expected
+    end
+
+    sig { params(keg_path: T.any(Pathname, String), generation: String).void }
+    def self.record_base_generation!(keg_path, generation)
+      validate_base_generation!(generation)
+      path = Pathname(keg_path).expand_path
+      rack = path.parent
+      unless active? && path.directory? && !path.symlink? &&
+             rack.directory? && !rack.symlink? && rack.parent.expand_path == HOMEBREW_CELLAR.expand_path &&
+             valid_formula_name?(rack.basename.to_s) && valid_version_name?(path.basename.to_s) &&
+             path.stat.uid == Process.uid
+        raise TransactionFailure, "refusing to record a base generation outside a local keg: #{path}"
+      end
+
+      marker = path/BASE_GENERATION_MARKER
+      if marker.symlink? || (marker.exist? && !marker.file?)
+        raise TransactionFailure, "unsafe administrator base-generation marker: #{marker}"
+      end
+
+      marker.atomic_write("#{generation}\n")
+      marker.chmod 0600
+    end
+
+    sig { returns(T::Array[Pathname]) }
+    def self.base_generation_drift
+      return [] unless active?
+
+      current = current_base_generation
+      drift = T.let([], T::Array[Pathname])
+      HOMEBREW_CELLAR.children.sort.each do |rack|
+        next unless rack.directory? && !rack.symlink? && valid_formula_name?(rack.basename.to_s)
+
+        rack.children.sort.each do |keg|
+          next unless keg.directory? && !keg.symlink? && valid_version_name?(keg.basename.to_s)
+
+          marker = keg/BASE_GENERATION_MARKER
+          if marker.symlink? || !marker.file?
+            drift << keg
+            next
+          end
+
+          recorded = marker.read.chomp
+          drift << keg unless recorded.match?(BASE_GENERATION_PATTERN) && recorded == current
+        end
+      end
+      drift
     end
 
     sig { params(transaction: FormulaTransaction).void }
@@ -507,6 +642,30 @@ module Homebrew
 
       error = Fiddle.last_error
       raise SystemCallError.new("atomic overlay rack exchange failed", error)
+    end
+
+    # Remove a newly created, not-yet-committed local keg after an overlay
+    # install fails. The exact rack and version must both be real, user-owned
+    # paths in the active Cellar; inherited symlinks and pre-existing kegs are
+    # never accepted by this helper.
+    sig { params(formula_name: String, version: String).returns(T::Boolean) }
+    def self.discard_local_keg!(formula_name, version)
+      return false unless local_keg_realization?(formula_name, version)
+
+      rack = HOMEBREW_CELLAR/formula_name
+      keg = rack/version
+      unless rack.stat.uid == Process.uid && keg.stat.uid == Process.uid
+        raise TransactionFailure, "refusing to discard a local keg not owned by the current user: #{keg}"
+      end
+
+      remove_links_to!(keg)
+      FileUtils.rm_rf(keg)
+      raise TransactionFailure, "could not discard failed local keg: #{keg}" if keg.exist? || keg.symlink?
+
+      rack.rmdir_if_possible
+      clear_caches!
+      sync!
+      true
     end
 
     # Remove only symlinks in native Homebrew link roots that resolve into the

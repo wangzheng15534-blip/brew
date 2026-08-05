@@ -289,6 +289,24 @@ RSpec.describe Homebrew::Diagnostic::Checks do
     expect(findings.map(&:to_s).join("\n")).to include("administrator Homebrew base is unavailable")
   end
 
+  specify "#check_overlay_configuration reports local formulae built against an older base" do
+    base = mktmpdir
+    base_cellar = base/"Cellar"
+    base_cellar.mkpath
+    stale_keg = HOMEBREW_CELLAR/"foo/1.0"
+
+    allow(Homebrew::Overlay).to receive(:active?).and_return(true)
+    allow(Homebrew::Overlay).to receive(:base_prefix).and_return(base)
+    allow(Homebrew::Overlay).to receive(:base_cellar).and_return(base_cellar)
+    allow(Homebrew::Overlay).to receive(:transactions_dir).and_return(HOMEBREW_PREFIX/"var/homebrew/overlay/transactions")
+    allow(Homebrew::Overlay).to receive(:link_state_file).and_return(HOMEBREW_PREFIX/"var/homebrew/overlay/view.state")
+    allow(Homebrew::Overlay).to receive(:base_generation_drift).and_return([stale_keg])
+
+    findings = Array(checks.check_overlay_configuration)
+    message = findings.map(&:to_s).join("\n")
+    expect(message).to include("different administrator base generation", stale_keg.to_s)
+  end
+
   specify "#check_homebrew_prefix" do
     allow(Homebrew).to receive(:default_prefix?).and_return(false)
     expect(checks.check_homebrew_prefix&.to_s)

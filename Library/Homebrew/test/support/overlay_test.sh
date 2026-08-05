@@ -40,6 +40,7 @@ ln -s "../Caskroom/demo/1.0/demo" "${base}/bin/demo-cask"
 ln -s "${repository}/bin/brew" "${base}/bin/brew"
 # A Cellar oldname is metadata, not another independently installed formula.
 ln -s foo "${base}/Cellar/foo-old"
+printf 'generation-1\n' >"${base}/var/homebrew/overlay-generation"
 
 # A user brew.env is user-owned and must survive initialization unchanged.
 mkdir -p "${user_prefix}/etc/homebrew"
@@ -66,6 +67,8 @@ export HOMEBREW_OVERLAY_ACTIVE=1
 export HOMEBREW_OVERLAY_BASE_PREFIX="${base}"
 
 homebrew-overlay-sync --force
+base_generation="$(bash "${repository}/Library/Homebrew/utils/overlay.sh" --base-generation)"
+homebrew-overlay-base-generation-valid "${base_generation}"
 
 test -L "${user_prefix}/Cellar/foo"
 test "$(readlink "${user_prefix}/Cellar/foo")" = "${base}/Cellar/foo"
@@ -109,6 +112,7 @@ rm "${user_prefix}/Cellar/foo"
 mkdir -p "${user_prefix}/Cellar/foo/2.0/bin"
 printf '#!/bin/sh\nprintf "user-foo\\n"\n' >"${user_prefix}/Cellar/foo/2.0/bin/foo"
 chmod 0755 "${user_prefix}/Cellar/foo/2.0/bin/foo"
+printf '%s\n' "${base_generation}" >"${user_prefix}/Cellar/foo/2.0/.brew-overlay-base-generation"
 homebrew-overlay-sync --force
 
 test ! -L "${user_prefix}/Cellar/foo"
@@ -121,6 +125,47 @@ ln -s "../Cellar/foo/2.0" "${user_prefix}/opt/foo"
 ln -s "../../../Cellar/foo/2.0" "${user_prefix}/var/homebrew/linked/foo"
 homebrew-overlay-sync --force
 test "$(readlink "${user_prefix}/opt/foo")" = "../Cellar/foo/2.0"
+
+# Every real local keg records the administrator generation it was built
+# against. Missing or stale markers are surfaced without disabling the prefix.
+mkdir -p "${user_prefix}/Cellar/localonly/1.0"
+if ! homebrew-overlay-sync --force >"${work}/missing-generation.out" 2>"${work}/missing-generation.err"
+then
+  echo "generation drift reporting unexpectedly failed synchronization" >&2
+  exit 1
+fi
+grep -q 'administrator Homebrew base changed' "${work}/missing-generation.err"
+test -s "${user_prefix}/var/homebrew/overlay/base-drift.state"
+rm -rf "${user_prefix}/Cellar/localonly"
+homebrew-overlay-sync --force
+test ! -e "${user_prefix}/var/homebrew/overlay/base-drift.state"
+
+printf 'generation-2\n' >"${base}/var/homebrew/overlay-generation"
+new_base_generation="$(bash "${repository}/Library/Homebrew/utils/overlay.sh" --base-generation)"
+homebrew-overlay-base-generation-valid "${new_base_generation}"
+test "${new_base_generation}" != "${base_generation}"
+homebrew-overlay-sync --force 2>"${work}/stale-generation.err"
+grep -q 'administrator Homebrew base changed' "${work}/stale-generation.err"
+test -s "${user_prefix}/var/homebrew/overlay/base-drift.state"
+printf '%s\n' "${new_base_generation}" >"${user_prefix}/Cellar/foo/2.0/.brew-overlay-base-generation"
+homebrew-overlay-sync --force
+test ! -e "${user_prefix}/var/homebrew/overlay/base-drift.state"
+base_generation="${new_base_generation}"
+
+outside_generation="${work}/outside-generation"
+printf 'unchanged\n' >"${outside_generation}"
+rm "${user_prefix}/Cellar/foo/2.0/.brew-overlay-base-generation"
+ln -s "${outside_generation}" "${user_prefix}/Cellar/foo/2.0/.brew-overlay-base-generation"
+if homebrew-overlay-sync --force >"${work}/unsafe-generation.out" 2>"${work}/unsafe-generation.err"
+then
+  echo "unsafe base-generation marker unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -q 'unsafe base-generation marker' "${work}/unsafe-generation.err"
+grep -qx 'unchanged' "${outside_generation}"
+rm "${user_prefix}/Cellar/foo/2.0/.brew-overlay-base-generation"
+printf '%s\n' "${base_generation}" >"${user_prefix}/Cellar/foo/2.0/.brew-overlay-base-generation"
+homebrew-overlay-sync --force
 
 # An empty real rack cannot hide the base indefinitely; it receives inherited
 # version links on the next synchronization.

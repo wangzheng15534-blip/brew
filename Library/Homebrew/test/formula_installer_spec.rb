@@ -103,6 +103,21 @@ RSpec.describe FormulaInstaller do
   end
 
   describe "#finish" do
+    it "discards an uncommitted local overlay keg when generation validation fails" do
+      formula = formula "overlay-generation-race" do
+        T.bind(self, T.class_of(Formula))
+        url "foo-1.0"
+      end
+      installer = described_class.new(formula)
+      error = Homebrew::Overlay::BaseGenerationChangedError.new("a" * 64, "b" * 64)
+
+      allow(installer).to receive_messages(only_deps?: false, verbose?: false, unlock: nil)
+      allow(installer).to receive(:verify_overlay_base_generation!).and_raise(error)
+      expect(installer).to receive(:rollback_overlay_uncommitted_local_keg!)
+
+      expect { installer.finish }.to raise_error(error)
+    end
+
     it "runs structured post-install work through the post-install subprocess" do
       formula = formula "finish-install-steps" do
         T.bind(self, T.class_of(Formula))

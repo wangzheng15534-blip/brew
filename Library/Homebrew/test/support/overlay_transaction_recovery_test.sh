@@ -9,7 +9,6 @@ source "${repo}/Library/Homebrew/utils/overlay.sh"
 
 work="$(mktemp -d "${TMPDIR:-/tmp}/homebrew-overlay-transaction.XXXXXX")"
 trap 'rm -rf "${work}"' EXIT
-
 make_case() {
   local root="$1"
   mkdir -p \
@@ -30,9 +29,13 @@ make_case() {
 write_journal() {
   local root="$1" id="$2" state="$3"
   local transaction="${root}/user/var/homebrew/overlay/transactions/${id}"
+  local generation
   mkdir -p "${transaction}"
+  generation="$(homebrew-overlay-view-key "${root}/base")"
+  homebrew-overlay-base-generation-valid "${generation}"
   printf 'foo\n' >"${transaction}/formula"
   printf '2.0\n' >"${transaction}/version"
+  printf '%s\n' "${generation}" >"${transaction}/base_generation"
   printf '%s\n' "${state}" >"${transaction}/state"
 }
 
@@ -110,6 +113,8 @@ mkdir -p "${case5}/user/Cellar/foo/2.0/bin" \
          "${case5}/user/Cellar/.homebrew-overlay-racks/txn-commit"
 printf 'local\n' >"${case5}/user/Cellar/foo/2.0/bin/foo"
 printf 'txn-commit\n' >"${case5}/user/Cellar/foo/2.0/.brew-overlay-transaction"
+cp "${case5}/user/var/homebrew/overlay/transactions/txn-commit/base_generation" \
+  "${case5}/user/Cellar/foo/2.0/.brew-overlay-base-generation"
 ln -s "${case5}/base/Cellar/foo" \
   "${case5}/user/Cellar/.homebrew-overlay-racks/txn-commit/foo"
 activate "${case5}"
@@ -126,6 +131,8 @@ write_journal "${case6}" txn-foreign committed
 rm "${case6}/user/Cellar/foo"
 mkdir -p "${case6}/user/Cellar/foo/2.0"
 printf 'someone-else\n' >"${case6}/user/Cellar/foo/2.0/.brew-overlay-transaction"
+cp "${case6}/user/var/homebrew/overlay/transactions/txn-foreign/base_generation" \
+  "${case6}/user/Cellar/foo/2.0/.brew-overlay-base-generation"
 activate "${case6}"
 if homebrew-overlay-sync --force >"${case6}/stdout" 2>"${case6}/stderr"
 then
@@ -134,5 +141,25 @@ then
 fi
 test -d "${case6}/user/Cellar/foo/2.0"
 grep -q 'another transaction marker' "${case6}/stderr"
+
+# A committed transaction without the exact generation marker is corruption;
+# recovery must retain all evidence and stop.
+case7="${work}/wrong-base-generation"
+make_case "${case7}"
+write_journal "${case7}" txn-generation committed
+rm "${case7}/user/Cellar/foo"
+mkdir -p "${case7}/user/Cellar/foo/2.0"
+printf 'txn-generation\n' >"${case7}/user/Cellar/foo/2.0/.brew-overlay-transaction"
+printf '%.0s0' {1..64} >"${case7}/user/Cellar/foo/2.0/.brew-overlay-base-generation"
+printf '\n' >>"${case7}/user/Cellar/foo/2.0/.brew-overlay-base-generation"
+activate "${case7}"
+if homebrew-overlay-sync --force >"${case7}/stdout" 2>"${case7}/stderr"
+then
+  echo "wrong base-generation marker unexpectedly recovered" >&2
+  exit 1
+fi
+test -d "${case7}/user/Cellar/foo/2.0"
+test -d "${case7}/user/var/homebrew/overlay/transactions/txn-generation"
+grep -q 'wrong base generation' "${case7}/stderr"
 
 printf 'overlay transaction recovery test: PASS\n'
