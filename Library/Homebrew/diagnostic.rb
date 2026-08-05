@@ -14,6 +14,7 @@ require "cask/quarantine"
 require "diagnostic/finding"
 require "git_repository"
 require "missing"
+require "overlay"
 require "system_command"
 require "trust"
 
@@ -474,6 +475,7 @@ module Homebrew
 
       sig { returns(T.nilable(Finding)) }
       def check_multiple_cellars
+        return if Homebrew::Overlay.active?
         return if HOMEBREW_PREFIX.to_s == HOMEBREW_REPOSITORY.to_s
         return unless (HOMEBREW_REPOSITORY/"Cellar").exist?
         return unless (HOMEBREW_PREFIX/"Cellar").exist?
@@ -489,6 +491,76 @@ module Homebrew
             EOS
             commands: ["rm -rf #{HOMEBREW_REPOSITORY}/Cellar"],
           ),
+        )
+      end
+
+      sig { returns(T.nilable(T.any(Finding, T::Array[Finding]))) }
+      def check_overlay_configuration
+        return unless Homebrew::Overlay.active?
+
+        findings = T.let([], T::Array[Finding])
+        base_prefix = Homebrew::Overlay.base_prefix
+        base_cellar = Homebrew::Overlay.base_cellar
+
+        unless base_prefix.directory? && !base_prefix.symlink? &&
+               base_cellar.directory? && !base_cellar.symlink? && base_cellar.readable?
+          findings << Finding.new(
+            <<~EOS,
+              The administrator Homebrew base is unavailable or unsafe:
+                prefix: #{base_prefix}
+                Cellar: #{base_cellar}
+            EOS
+            tier:        :unsupported,
+            remediation: "Restore a real, readable administrator prefix and Cellar before using the overlay.",
+          )
+        end
+
+        user_cellar = HOMEBREW_CELLAR
+        prefix_safe = HOMEBREW_PREFIX.directory? && !HOMEBREW_PREFIX.symlink? &&
+                      HOMEBREW_PREFIX.stat.uid == Process.uid && HOMEBREW_PREFIX.writable?
+        cellar_safe = user_cellar.directory? && !user_cellar.symlink? &&
+                      user_cellar.stat.uid == Process.uid && user_cellar.writable?
+        unless prefix_safe && cellar_safe
+          findings << Finding.new(
+            <<~EOS,
+              The user Homebrew overlay is not a real, user-owned writable prefix:
+                prefix: #{HOMEBREW_PREFIX}
+                Cellar: #{user_cellar}
+            EOS
+            tier:        :unsupported,
+            remediation: "Repair ownership or recreate the user prefix; do not symlink the prefix or Cellar.",
+          )
+        end
+
+        transactions = Homebrew::Overlay.transactions_dir
+        if transactions.directory? && transactions.children.any?
+          findings << Finding.new(
+            <<~EOS,
+              Incomplete overlay formula transactions remain in:
+                #{transactions}
+            EOS
+            tier:        :unsupported,
+            remediation: "Run any brew command to invoke recovery, then inspect the transaction journals if it fails.",
+          )
+        end
+
+        state_file = Homebrew::Overlay.link_state_file
+        if state_file.symlink? || (state_file.exist? && !state_file.file?)
+          findings << Finding.new(
+            <<~EOS,
+              The overlay package-view state is not a safe regular file:
+                #{state_file}
+            EOS
+            tier:        :unsupported,
+            remediation: "Remove the unsafe state entry and rerun brew so the package view can be regenerated.",
+          )
+        end
+
+        findings.presence
+      rescue SystemCallError, RuntimeError => e
+        Finding.new(
+          "The Homebrew overlay configuration could not be inspected: #{e}",
+          tier: :unsupported,
         )
       end
 
@@ -1217,6 +1289,7 @@ module Homebrew
 
       sig { returns(T.nilable(Finding)) }
       def check_homebrew_prefix
+        return if Homebrew::Overlay.active?
         return if Homebrew.default_prefix?
 
         Finding.new(

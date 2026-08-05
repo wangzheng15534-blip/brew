@@ -392,6 +392,37 @@ module Homebrew
       end
     end
 
+    sig { params(formula_name: String).returns(T.nilable(Pathname)) }
+    def self.base_rack(formula_name)
+      return unless active? && valid_formula_name?(formula_name)
+
+      rack = base_cellar/formula_name
+      return unless rack.directory? && !rack.symlink?
+      return unless rack.children.any? do |child|
+        child.directory? && !child.symlink? && !child.basename.to_s.start_with?(".")
+      end
+
+      rack
+    end
+
+    sig { params(formula_name: String).returns(T::Boolean) }
+    def self.base_formula_available?(formula_name)
+      !base_rack(formula_name).nil?
+    end
+
+    sig { params(formula: T.untyped).returns(T::Boolean) }
+    def self.inherited_only_formula?(formula)
+      return false unless active?
+
+      kegs = formula.installed_kegs
+      kegs.any? && kegs.all? { |keg| inherited_keg?(keg.to_path) }
+    end
+
+    sig { params(formula_name: String).returns(T::Boolean) }
+    def self.inherited_migration_target?(formula_name)
+      base_formula_available?(formula_name)
+    end
+
     sig { params(formula: T.untyped).returns(T::Boolean) }
     def self.transaction_required?(formula)
       return false unless active? && valid_formula_name?(formula.name)

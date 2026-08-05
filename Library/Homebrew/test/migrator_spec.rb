@@ -55,6 +55,21 @@ RSpec.describe Migrator do
     end
   end
 
+  describe ".migrate_if_needed" do
+    it "leaves a local old-name rack untouched when the new name is inherited" do
+      allow(described_class).to receive(:oldnames_needing_migration).with(new_formula).and_return(["oldname"])
+      allow(Homebrew::Overlay).to receive(:inherited_migration_target?).with("newname").and_return(true)
+      expect(described_class).not_to receive(:new)
+
+      expect do
+        described_class.migrate_if_needed(new_formula, force: false)
+      end.to output(/Not migrating.*oldname.*newname/m).to_stderr
+
+      expect(old_keg_record/"bin/inside").to be_a_file
+      expect(new_keg_record).not_to exist
+    end
+  end
+
   describe "::new" do
     it "raises an error if there is no old path" do
       expect do

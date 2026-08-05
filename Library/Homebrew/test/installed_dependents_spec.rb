@@ -261,6 +261,16 @@ RSpec.describe InstalledDependents do
       expect(described_class.find_some_installed_dependents([keg])).to be_nil
     end
 
+    specify "a local replacement can be removed when an administrator fallback remains" do
+      dependent = setup_test_keg("bar", "1.0") do
+        depends_on "foo"
+      end
+      tab_dependencies dependent, [{ "full_name" => "foo", "version" => "1.0" }]
+      allow(Homebrew::Overlay).to receive(:base_formula_available?).with("foo").and_return(true)
+
+      expect(described_class.find_some_installed_dependents([keg])).to be_nil
+    end
+
     specify "tab with dependency blocks uninstall" do
       # Tab records that bar depends on foo — foo should block uninstall.
       dependent = setup_test_keg("bar", "1.0") do

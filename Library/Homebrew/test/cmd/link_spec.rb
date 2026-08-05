@@ -7,6 +7,17 @@ require "cmd/shared_examples/args_parse"
 RSpec.describe Homebrew::Cmd::Link do
   it_behaves_like "parseable arguments"
 
+  it "rejects an inherited keg before linking anything" do
+    keg = instance_double(Keg, to_path: HOMEBREW_CELLAR/"foo/1.0")
+    cmd = described_class.new(["foo"])
+    allow(cmd.args.named).to receive(:to_latest_kegs).and_return([keg])
+    allow(Homebrew::Overlay).to receive(:inherited_keg?).with(keg.to_path).and_return(true)
+    allow(Homebrew::Overlay).to receive(:base_prefix).and_return(Pathname("/home/linuxbrew/.linuxbrew"))
+    expect(keg).not_to receive(:link)
+
+    expect { cmd.run }.to raise_error(Homebrew::Overlay::InheritedKegError)
+  end
+
   it "uses formula-aware conflict handling when linking a Formula" do
     formula = formula "testball" do
       T.bind(self, T.class_of(Formula))

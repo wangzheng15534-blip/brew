@@ -4,6 +4,7 @@
 require "abstract_subcommand"
 require "bundle/extensions/extension"
 require "cleanup"
+require "overlay"
 
 require "utils/formatter"
 require "utils"
@@ -161,7 +162,9 @@ module Homebrew
               else
                 []
               end
-              Kernel.system HOMEBREW_BREW_FILE, "uninstall", "--cask", *args, "--force", *casks
+              success = Kernel.system HOMEBREW_BREW_FILE, "uninstall", "--cask", *args, "--force", *casks
+              raise "Cask cleanup failed; no successful uninstall count was recorded." unless success
+
               puts "Uninstalled #{casks.size} cask#{"s" if casks.size != 1}"
             end
 
@@ -170,11 +173,16 @@ module Homebrew
               # from removing them when their dependents are uninstalled
               Homebrew::Bundle.mark_as_installed_on_request!(dsl.entries)
 
-              Kernel.system HOMEBREW_BREW_FILE, "uninstall", "--formula", "--force", *formulae
+              success = Kernel.system HOMEBREW_BREW_FILE, "uninstall", "--formula", "--force", *formulae
+              raise "Formula cleanup failed; no successful uninstall count was recorded." unless success
+
               puts "Uninstalled #{formulae.size} formula#{"e" if formulae.size != 1}"
             end
 
-            Kernel.system HOMEBREW_BREW_FILE, "untap", *taps if taps.any?
+            if taps.any?
+              success = Kernel.system HOMEBREW_BREW_FILE, "untap", *taps
+              raise "Tap cleanup failed." unless success
+            end
 
             cleanup_extensions.each do |extension, items|
               next if items.empty?
@@ -267,7 +275,15 @@ module Homebrew
             Homebrew::Bundle::Brew.formula_in_array?(f[:full_name], kept_formulae)
           end
 
-          # Don't try to uninstall formulae with keepme references
+          # Administrator-only formulae are inherited package view entries,
+          # not user-owned cleanup candidates.
+          current_formulae.reject! do |f|
+            Homebrew::Overlay.inherited_only_formula?(Formula[f[:full_name]])
+          rescue FormulaUnavailableError
+            false
+          end
+
+          # Don't try to uninstall formulae with keepme references.
           current_formulae.reject! do |f|
             Formula[f[:full_name]].installed_kegs.any? do |keg|
               keg.keepme_refs.present?

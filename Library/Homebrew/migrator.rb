@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require "lock_file"
+require "overlay"
 require "keg"
 require "tab"
 require "utils"
@@ -126,12 +127,24 @@ class Migrator
     !oldnames_needing_migration(formula).empty?
   end
 
-  sig { params(formula: Formula, force: T::Boolean, dry_run: T::Boolean).void }
-  def self.migrate_if_needed(formula, force:, dry_run: false)
+  sig { params(formula: Formula, force: T::Boolean, dry_run: T::Boolean, strict_inherited: T::Boolean).void }
+  def self.migrate_if_needed(formula, force:, dry_run: false, strict_inherited: false)
     oldnames = Migrator.oldnames_needing_migration(formula)
 
     begin
       oldnames.each do |oldname|
+        if Homebrew::Overlay.inherited_migration_target?(formula.name)
+          action = dry_run ? "Would not migrate" : "Not migrating"
+          message = <<~EOS
+            #{action} #{Formatter.identifier(oldname)} into inherited administrator formula
+            #{Formatter.identifier(formula.name)}.
+            The local #{oldname} rack was left untouched. Install or reinstall #{formula.name}
+            to create a separate writable realization, then remove #{oldname} after validating it.
+          EOS
+          strict_inherited && !dry_run ? ofail(message) : opoo(message)
+          next
+        end
+
         if dry_run
           oh1 "Would migrate formula #{Formatter.identifier(oldname)} to #{Formatter.identifier(formula.name)}"
           next

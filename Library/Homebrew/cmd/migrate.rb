@@ -33,7 +33,12 @@ module Homebrew
         args.named.to_formulae_and_casks(warn: false).each do |formula_or_cask|
           case formula_or_cask
           when Formula
-            Migrator.migrate_if_needed(formula_or_cask, force: args.force?, dry_run: args.dry_run?)
+            Migrator.migrate_if_needed(
+              formula_or_cask,
+              force:            args.force?,
+              dry_run:          args.dry_run?,
+              strict_inherited: true,
+            )
           when Cask::Cask
             Cask::Migrator.migrate_if_needed(formula_or_cask, dry_run: args.dry_run?)
           end

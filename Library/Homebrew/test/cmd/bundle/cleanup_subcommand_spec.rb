@@ -251,6 +251,19 @@ RSpec.describe Homebrew::Cmd::Bundle::CleanupSubcommand do
       expect(described_class.taps_to_untap).to eql(%w[z homebrew/tap])
     end
 
+    it "excludes administrator-only inherited formulae from cleanup" do
+      name = full_name = "base-only"
+      allow(Homebrew::Bundle::Brew).to receive(:formulae).and_return([{ name:, full_name: }])
+      f = formula(name) do
+        T.bind(self, T.class_of(Formula))
+        url "#{name}-1.0"
+      end
+      stub_formula_loader f, name
+      allow(Homebrew::Overlay).to receive(:inherited_only_formula?).with(f).and_return(true)
+
+      expect(described_class.formulae_to_uninstall).to be_empty
+    end
+
     it "ignores formulae with .keepme references when computing which formulae to uninstall" do
       name = full_name ="c"
       allow(Homebrew::Bundle::Brew).to receive(:formulae).and_return([{ name:, full_name: }])
@@ -356,7 +369,7 @@ RSpec.describe Homebrew::Cmd::Bundle::CleanupSubcommand do
     end
 
     it "uninstalls casks" do
-      expect(Kernel).to receive(:system).with(HOMEBREW_BREW_FILE, "uninstall", "--cask", "--force", "a", "b")
+      expect(Kernel).to receive(:system).with(HOMEBREW_BREW_FILE, "uninstall", "--cask", "--force", "a", "b").and_return(true)
       expect(described_class).to receive(:system_output_no_stderr).and_return("")
       expect do
         described_class.cleanup(force: true)
@@ -381,7 +394,7 @@ RSpec.describe Homebrew::Cmd::Bundle::CleanupSubcommand do
     end
 
     it "uninstalls casks" do
-      expect(Kernel).to receive(:system).with(HOMEBREW_BREW_FILE, "uninstall", "--cask", "--zap", "--force", "a", "b")
+      expect(Kernel).to receive(:system).with(HOMEBREW_BREW_FILE, "uninstall", "--cask", "--zap", "--force", "a", "b").and_return(true)
       expect(described_class).to receive(:system_output_no_stderr).and_return("")
       expect do
         described_class.cleanup(force: true, zap: true)
@@ -409,11 +422,20 @@ RSpec.describe Homebrew::Cmd::Bundle::CleanupSubcommand do
     end
 
     it "uninstalls formulae" do
-      expect(Kernel).to receive(:system).with(HOMEBREW_BREW_FILE, "uninstall", "--formula", "--force", "a", "b")
+      expect(Kernel).to receive(:system).with(HOMEBREW_BREW_FILE, "uninstall", "--formula", "--force", "a", "b").and_return(true)
       expect(described_class).to receive(:system_output_no_stderr).and_return("")
       expect do
         described_class.cleanup(force: true)
       end.to output(/Uninstalled 2 formulae/).to_stdout
+    end
+
+    it "does not report success when the formula uninstall command fails" do
+      expect(Kernel).to receive(:system).and_return(false)
+      expect(described_class).not_to receive(:system_output_no_stderr)
+
+      expect do
+        described_class.cleanup(force: true)
+      end.to raise_error(RuntimeError, /Formula cleanup failed/)
     end
 
     it "does not uninstall formulae if --casks is disabled" do
@@ -436,7 +458,7 @@ RSpec.describe Homebrew::Cmd::Bundle::CleanupSubcommand do
     end
 
     it "untaps taps" do
-      expect(Kernel).to receive(:system).with(HOMEBREW_BREW_FILE, "untap", "a", "b")
+      expect(Kernel).to receive(:system).with(HOMEBREW_BREW_FILE, "untap", "a", "b").and_return(true)
       expect(described_class).to receive(:system_output_no_stderr).and_return("")
       described_class.cleanup(force: true)
     end
@@ -533,9 +555,9 @@ RSpec.describe Homebrew::Cmd::Bundle::CleanupSubcommand do
       allow(Kernel).to receive(:system)
       allow(described_class).to receive(:system_output_no_stderr).and_return("")
       allow(Formatter).to receive(:columns).with(%w[a b]).and_return("a b")
-      expect(Kernel).to receive(:system).with(HOMEBREW_BREW_FILE, "uninstall", "--cask", "--force", "a", "b")
-      expect(Kernel).to receive(:system).with(HOMEBREW_BREW_FILE, "uninstall", "--formula", "--force", "a", "b")
-      expect(Kernel).to receive(:system).with(HOMEBREW_BREW_FILE, "untap", "a", "b")
+      expect(Kernel).to receive(:system).with(HOMEBREW_BREW_FILE, "uninstall", "--cask", "--force", "a", "b").and_return(true)
+      expect(Kernel).to receive(:system).with(HOMEBREW_BREW_FILE, "uninstall", "--formula", "--force", "a", "b").and_return(true)
+      expect(Kernel).to receive(:system).with(HOMEBREW_BREW_FILE, "untap", "a", "b").and_return(true)
       expect(Homebrew::Cleanup).to receive(:dry_run_output).and_return("")
 
       expect { described_class.cleanup(ask: true) }.not_to output(/Run .brew bundle cleanup --force/).to_stdout

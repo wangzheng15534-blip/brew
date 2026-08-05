@@ -270,6 +270,25 @@ RSpec.describe Homebrew::Diagnostic::Checks do
     end
   end
 
+  specify "overlay mode suppresses destructive multiple-Cellar and non-default-prefix advice" do
+    allow(Homebrew::Overlay).to receive(:active?).and_return(true)
+    allow(Homebrew).to receive(:default_prefix?).and_return(false)
+
+    expect(checks.check_multiple_cellars).to be_nil
+    expect(checks.check_homebrew_prefix).to be_nil
+  end
+
+  specify "#check_overlay_configuration reports an unavailable administrator base" do
+    allow(Homebrew::Overlay).to receive(:active?).and_return(true)
+    allow(Homebrew::Overlay).to receive(:base_prefix).and_return(Pathname("/missing/base"))
+    allow(Homebrew::Overlay).to receive(:base_cellar).and_return(Pathname("/missing/base/Cellar"))
+    allow(Homebrew::Overlay).to receive(:transactions_dir).and_return(HOMEBREW_PREFIX/"var/homebrew/overlay/transactions")
+    allow(Homebrew::Overlay).to receive(:link_state_file).and_return(HOMEBREW_PREFIX/"var/homebrew/overlay/view.state")
+
+    findings = Array(checks.check_overlay_configuration)
+    expect(findings.map(&:to_s).join("\n")).to include("administrator Homebrew base is unavailable")
+  end
+
   specify "#check_homebrew_prefix" do
     allow(Homebrew).to receive(:default_prefix?).and_return(false)
     expect(checks.check_homebrew_prefix&.to_s)

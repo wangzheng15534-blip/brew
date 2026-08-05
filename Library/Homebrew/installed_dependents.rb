@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require "cask_dependent"
+require "overlay"
 
 # Helper functions for installed dependents.
 module InstalledDependents
@@ -24,7 +25,12 @@ module InstalledDependents
     params(kegs: T::Array[Keg], casks: T::Array[Cask::Cask]).returns(T.nilable([T::Array[Keg], T::Array[String]]))
   }
   def find_some_installed_dependents(kegs, casks: [])
-    keg_names = kegs.select(&:optlinked?).map(&:name)
+    # Removing a local overlay replacement immediately exposes the matching
+    # administrator rack. Do not pretend that dependency is absent when
+    # evaluating dependents; the fallback remains installed after removal.
+    keg_names = kegs.select(&:optlinked?).reject do |keg|
+      Homebrew::Overlay.base_formula_available?(keg.name)
+    end.map(&:name)
     keg_formulae = []
     kegs_by_source = kegs.group_by do |keg|
       # First, attempt to resolve the keg to a formula

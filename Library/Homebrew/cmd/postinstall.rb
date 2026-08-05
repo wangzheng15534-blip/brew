@@ -3,6 +3,7 @@
 
 require "abstract_command"
 require "formula_installer"
+require "overlay"
 
 module Homebrew
   module Cmd
@@ -17,7 +18,15 @@ module Homebrew
 
       sig { override.void }
       def run
-        args.named.to_resolved_formulae.each do |f|
+        formulae = args.named.to_resolved_formulae
+        if (formula = formulae.find { |candidate| Homebrew::Overlay.inherited_keg?(candidate.prefix) })
+          raise Homebrew::Overlay::InheritedKegError.new(
+            formula.prefix,
+            Homebrew::Overlay.base_prefix,
+          )
+        end
+
+        formulae.each do |f|
           ohai "Postinstalling #{f}"
           f.install_etc_var
           post_install_steps_defined = f.post_install_steps_defined?
