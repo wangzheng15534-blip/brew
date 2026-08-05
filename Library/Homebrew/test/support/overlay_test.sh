@@ -63,6 +63,7 @@ test "$(readlink "${environment_prefix}/opt/foo")" = "../Cellar/foo/1.5"
 test "$(readlink "${environment_prefix}/var/homebrew/linked/foo")" = \
   "${environment_prefix}/Cellar/foo/1.5"
 test "$(stat -c '%a' "${environment_prefix}/etc/homebrew/brew.env")" = 600
+grep -qx 'HOMEBREW_NO_AUTO_UPDATE=1' "${environment_prefix}/etc/homebrew/brew.env"
 
 # Replacing an inherited rack with a real user rack must shadow every parent.
 rm "${packages}/default/Cellar/foo"

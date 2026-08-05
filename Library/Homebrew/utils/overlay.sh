@@ -84,6 +84,7 @@ HOMEBREW_OVERLAY_PARENT_PREFIXES=${parent_prefixes}
 HOMEBREW_OVERLAY_USER_ENV_DIR=${user_environment_dir}
 HOMEBREW_OVERLAY_USER_PACKAGE_DIR=${user_package_dir}
 HOMEBREW_OVERLAY_USER_CELLAR=${user_cellar}
+HOMEBREW_NO_AUTO_UPDATE=1
 EOF_ENV
   chmod 0600 "${environment_file}"
 }
