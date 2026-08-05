@@ -21,6 +21,7 @@ Documentation is grouped below by audience: users, contributors, maintainers and
 - [`brew` Shell Completion](Shell-Completion.md)
 - [Command Not Found](Command-Not-Found.md)
 - [Homebrew on Linux](Homebrew-on-Linux.md)
+- [Overlay Environments on Linux](Overlay-Environments.md)
 - [Homebrew Bundle, `brew bundle` and `Brewfile`](Brew-Bundle-and-Brewfile.md)
 - [Homebrew MCP Server](MCP-Server.md)
 
