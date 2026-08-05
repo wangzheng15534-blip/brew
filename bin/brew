@@ -156,8 +156,10 @@ then
   SYSTEM_ENV_TAKES_PRIORITY="1"
 fi
 
-# Next, load the prefix configuration
+# Next, load the prefix configuration. The optional overlay has a separate
+# managed file so initialization never rewrites user-owned brew.env settings.
 export_homebrew_env_file "${HOMEBREW_PREFIX}/etc/homebrew/brew.env"
+export_homebrew_env_file "${HOMEBREW_PREFIX}/etc/homebrew/overlay.env"
 
 # Finally, load the user configuration
 if [[ -n "${XDG_CONFIG_HOME-}" ]]
@@ -182,7 +184,7 @@ fi
 # prefix into a native-layout per-user Homebrew prefix. Keep this before
 # environment filtering and in sync with Library/Homebrew/utils/overlay.sh.
 source "${HOMEBREW_REPOSITORY}/Library/Homebrew/utils/overlay.sh"
-homebrew-overlay-bootstrap "$@"
+homebrew-overlay-bootstrap "$@" || exit $?
 
 # Use HOMEBREW_FORCE_BREW_WRAPPER if set.
 export HOMEBREW_ORIGINAL_BREW_FILE="${HOMEBREW_BREW_FILE}"

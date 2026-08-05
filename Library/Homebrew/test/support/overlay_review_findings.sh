@@ -1,26 +1,20 @@
 #!/bin/bash
-# Reproduce shell-level defects found during the native overlay review.
-# This intentionally uses `set -u` without `set -e`, matching bin/brew.
-set -u
+# Regression coverage for defects identified by the rigorous native-overlay review.
+set -euo pipefail
 
 repo="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd -P)}"
+repo="$(cd "${repo}" && pwd -P)"
+# shellcheck source=../../utils/overlay.sh
 source "${repo}/Library/Homebrew/utils/overlay.sh"
 
-work="$(mktemp -d "${TMPDIR:-/tmp}/homebrew-native-overlay-review.XXXXXX")"
+work="$(mktemp -d "${TMPDIR:-/tmp}/homebrew-native-overlay-regression.XXXXXX")"
 trap 'rm -rf "${work}"' EXIT
-confirmed=0
+passed=0
 expected=7
 
-record_defect() {
-  local label="$1"
-  shift
-  if "$@"
-  then
-    printf 'CONFIRMED: %s\n' "$label"
-    confirmed=$((confirmed + 1))
-  else
-    printf 'NOT REPRODUCED: %s\n' "$label"
-  fi
+record_pass() {
+  printf 'PASS: %s\n' "$1"
+  passed=$((passed + 1))
 }
 
 make_base_formula() {
@@ -43,120 +37,119 @@ make_base_formula() {
 make_user_roots() {
   local user="$1"
   mkdir -p \
-    "${user}/Cellar" \
-    "${user}/bin" \
-    "${user}/etc" \
-    "${user}/Frameworks" \
-    "${user}/include" \
-    "${user}/lib" \
-    "${user}/opt" \
-    "${user}/sbin" \
-    "${user}/share" \
-    "${user}/var/homebrew/linked" \
-    "${user}/var/homebrew/locks"
+    "${user}/Cellar" "${user}/bin" "${user}/etc/homebrew" \
+    "${user}/Frameworks" "${user}/include" "${user}/lib" "${user}/opt" \
+    "${user}/sbin" "${user}/share" "${user}/var/homebrew/linked" \
+    "${user}/var/homebrew/locks" "${user}/var/homebrew/overlay/transactions" \
+    "${user}/var/homebrew/overlay/sync"
 }
 
-printf 'CASE 1: active bootstrap reports success after Cellar synchronization fails\n'
+printf 'CASE 1: active bootstrap propagates Cellar synchronization failure\n'
 case1="${work}/case1"
-mkdir -p "${case1}/base/Cellar" "${case1}/user/var/homebrew/locks" \
-  "${case1}/user/var/homebrew" "${case1}/user/bin"
+mkdir -p "${case1}/base/Cellar"
+make_user_roots "${case1}/user"
+rm -rf "${case1}/user/Cellar"
 ln -s "${case1}/base/Cellar" "${case1}/user/Cellar"
-HOMEBREW_PREFIX="${case1}/user"
-HOMEBREW_OVERLAY=1
-HOMEBREW_OVERLAY_ACTIVE=1
-HOMEBREW_OVERLAY_BASE_PREFIX="${case1}/base"
-export HOMEBREW_PREFIX HOMEBREW_OVERLAY HOMEBREW_OVERLAY_ACTIVE HOMEBREW_OVERLAY_BASE_PREFIX
-homebrew-overlay-bootstrap --cellar >"${case1}/stdout" 2>"${case1}/stderr"
-case1_status=$?
-printf 'status=%s stderr=%s\n' "${case1_status}" "$(tr '\n' '|' <"${case1}/stderr")"
-record_defect 'bootstrap suppresses failed synchronization' test "${case1_status}" -eq 0
+export HOMEBREW_PREFIX="${case1}/user"
+export HOMEBREW_OVERLAY=1
+export HOMEBREW_OVERLAY_ACTIVE=1
+export HOMEBREW_OVERLAY_BASE_PREFIX="${case1}/base"
+if homebrew-overlay-bootstrap --cellar >"${case1}/stdout" 2>"${case1}/stderr"
+then
+  echo 'bootstrap suppressed synchronization failure' >&2
+  exit 1
+fi
+grep -q 'user overlay Cellar is not a real directory' "${case1}/stderr"
+record_pass 'bootstrap propagates failed synchronization'
 
-printf 'CASE 2: an empty real rack permanently hides the inherited rack\n'
+printf 'CASE 2: an empty real rack receives inherited versions\n'
 case2="${work}/case2"
 make_base_formula "${case2}/base" foo 1.0
 make_user_roots "${case2}/user"
-HOMEBREW_PREFIX="${case2}/user"
-HOMEBREW_OVERLAY_BASE_PREFIX="${case2}/base"
-export HOMEBREW_PREFIX HOMEBREW_OVERLAY_BASE_PREFIX
-homebrew-overlay-sync >/dev/null 2>&1
+export HOMEBREW_PREFIX="${case2}/user"
+export HOMEBREW_OVERLAY_BASE_PREFIX="${case2}/base"
+homebrew-overlay-sync --force
 rm "${case2}/user/Cellar/foo"
 mkdir "${case2}/user/Cellar/foo"
-homebrew-overlay-sync >/dev/null 2>&1
-printf 'rack_symlink=%s base_keg_visible=%s\n' \
-  "$([[ -L "${case2}/user/Cellar/foo" ]] && echo yes || echo no)" \
-  "$([[ -d "${case2}/user/Cellar/foo/1.0" ]] && echo yes || echo no)"
-record_defect 'empty or interrupted local rack hides base indefinitely' \
-  test ! -e "${case2}/user/Cellar/foo/1.0"
+homebrew-overlay-sync --force
+test -L "${case2}/user/Cellar/foo/1.0"
+test -d "${case2}/user/Cellar/foo/1.0"
+record_pass 'empty/interrupted local rack no longer hides base'
 
-printf 'CASE 3: prefix reinitialization overwrites user brew.env settings\n'
+printf 'CASE 3: initialization preserves user brew.env\n'
 case3="${work}/case3"
-mkdir -p "${case3}/base/Cellar" "${case3}/repo/bin" "${case3}/home"
-printf '#!/bin/bash\n' >"${case3}/repo/bin/brew"
-chmod 0755 "${case3}/repo/bin/brew"
+mkdir -p "${case3}/base/Cellar" "${case3}/home/.linuxbrew/etc/homebrew"
+printf '#!/bin/bash\n' >"${case3}/brew"
+chmod 0755 "${case3}/brew"
+mkdir -p "${case3}/repo/bin"
+cp "${case3}/brew" "${case3}/repo/bin/brew"
+printf 'HOMEBREW_NO_ANALYTICS=1\n' >"${case3}/home/.linuxbrew/etc/homebrew/brew.env"
 HOME="${case3}/home" homebrew-overlay-initialize-prefix \
   "${case3}/base" "${case3}/repo" "${case3}/home/.linuxbrew" >/dev/null
-printf 'HOMEBREW_NO_ANALYTICS=1\n' >>"${case3}/home/.linuxbrew/etc/homebrew/brew.env"
 HOME="${case3}/home" homebrew-overlay-initialize-prefix \
   "${case3}/base" "${case3}/repo" "${case3}/home/.linuxbrew" >/dev/null
-record_defect 'reinitialization destroys unrelated user configuration' \
-  sh -c "! grep -q '^HOMEBREW_NO_ANALYTICS=1$' '${case3}/home/.linuxbrew/etc/homebrew/brew.env'"
+grep -qx 'HOMEBREW_NO_ANALYTICS=1' "${case3}/home/.linuxbrew/etc/homebrew/brew.env"
+test -f "${case3}/home/.linuxbrew/etc/homebrew/overlay.env"
+record_pass 'reinitialization preserves unrelated user configuration'
 
-printf 'CASE 4: an explicit unlink is recreated on the next invocation\n'
+printf 'CASE 4: inherited executable fallback does not require prefix projection\n'
 case4="${work}/case4"
 make_base_formula "${case4}/base" foo 1.0
 make_user_roots "${case4}/user"
-HOMEBREW_PREFIX="${case4}/user"
-HOMEBREW_OVERLAY_BASE_PREFIX="${case4}/base"
-export HOMEBREW_PREFIX HOMEBREW_OVERLAY_BASE_PREFIX
-homebrew-overlay-sync >/dev/null 2>&1
-rm -f "${case4}/user/bin/foo" "${case4}/user/opt/foo" \
-  "${case4}/user/var/homebrew/linked/foo"
-homebrew-overlay-sync >/dev/null 2>&1
-record_defect 'inherited unlink state is not persistent' test -L "${case4}/user/bin/foo"
+export HOMEBREW_PREFIX="${case4}/user"
+export HOMEBREW_OVERLAY_BASE_PREFIX="${case4}/base"
+homebrew-overlay-sync --force
+test ! -e "${case4}/user/bin/foo"
+test "$(env PATH="${case4}/user/bin:${case4}/base/bin:/usr/bin:/bin" foo)" = base-foo
+record_pass 'lower executable stays in native base prefix and works through PATH fallback'
 
-printf 'CASE 5: unsafe destination parents cause silent partial synchronization\n'
+printf 'CASE 5: unsafe destination parent is a hard failure\n'
 case5="${work}/case5"
 make_base_formula "${case5}/base" foo 1.0
 make_user_roots "${case5}/user"
-rm -rf "${case5}/user/bin"
-mkdir -p "${case5}/outside"
-ln -s "${case5}/outside" "${case5}/user/bin"
-HOMEBREW_PREFIX="${case5}/user"
-HOMEBREW_OVERLAY_BASE_PREFIX="${case5}/base"
-export HOMEBREW_PREFIX HOMEBREW_OVERLAY_BASE_PREFIX
-homebrew-overlay-sync >"${case5}/stdout" 2>"${case5}/stderr"
-case5_status=$?
-printf 'status=%s projected=%s stderr=%s\n' \
-  "${case5_status}" \
-  "$([[ -e "${case5}/user/bin/foo" || -L "${case5}/user/bin/foo" ]] && echo yes || echo no)" \
-  "$(tr '\n' '|' <"${case5}/stderr")"
-record_defect 'synchronizer succeeds while omitting a required inherited link' \
-  sh -c "test '${case5_status}' -eq 0 && test ! -e '${case5}/user/bin/foo' && test ! -L '${case5}/user/bin/foo'"
+rm -rf "${case5}/user/opt"
+mkdir "${case5}/outside"
+ln -s "${case5}/outside" "${case5}/user/opt"
+export HOMEBREW_PREFIX="${case5}/user"
+export HOMEBREW_OVERLAY_BASE_PREFIX="${case5}/base"
+if homebrew-overlay-sync --force >"${case5}/stdout" 2>"${case5}/stderr"
+then
+  echo 'unsafe destination parent was silently skipped' >&2
+  exit 1
+fi
+test ! -e "${case5}/outside/foo"
+grep -q 'unsafe parent blocks inherited package view' "${case5}/stderr"
+record_pass 'unsafe destination parent stops synchronization'
 
-printf 'CASE 6: lexical containment permits deletion through a dot-dot path\n'
+printf 'CASE 6: state paths are relative, normalized, and confined\n'
 case6="${work}/case6"
-make_user_roots "${case6}/prefix"
+make_base_formula "${case6}/base" foo 1.0
+make_user_roots "${case6}/user"
 printf 'payload\n' >"${case6}/target"
 ln -s "${case6}/target" "${case6}/outside-link"
-printf '%s\t%s\n' \
-  "${case6}/prefix/../outside-link" "${case6}/target" > \
-  "${case6}/prefix/var/homebrew/overlay-links.tsv"
-homebrew-overlay-remove-recorded-links \
-  "${case6}/prefix" "${case6}/prefix/var/homebrew/overlay-links.tsv"
-record_defect 'state cleanup can remove a symlink outside the prefix' \
-  test ! -L "${case6}/outside-link"
+printf '../outside-link\0%s\0' "${case6}/target" >"${case6}/user/var/homebrew/overlay/view.state"
+export HOMEBREW_PREFIX="${case6}/user"
+export HOMEBREW_OVERLAY_BASE_PREFIX="${case6}/base"
+if homebrew-overlay-sync --force >"${case6}/stdout" 2>"${case6}/stderr"
+then
+  echo 'path traversal state unexpectedly succeeded' >&2
+  exit 1
+fi
+test -L "${case6}/outside-link"
+grep -q 'invalid overlay view state' "${case6}/stderr"
+record_pass 'state cleanup cannot escape the active prefix'
 
-printf 'CASE 7: a base oldname rack symlink is projected as another installed rack\n'
+printf 'CASE 7: administrator Cellar oldname symlinks are not projected as racks\n'
 case7="${work}/case7"
 make_user_roots "${case7}/user"
-mkdir -p "${case7}/base/Cellar/newname/1.0"
+mkdir -p "${case7}/base/Cellar/newname/1.0" "${case7}/base/opt" "${case7}/base/var/homebrew/linked"
 ln -s newname "${case7}/base/Cellar/oldname"
-HOMEBREW_PREFIX="${case7}/user"
-HOMEBREW_OVERLAY_BASE_PREFIX="${case7}/base"
-export HOMEBREW_PREFIX HOMEBREW_OVERLAY_BASE_PREFIX
-homebrew-overlay-sync >/dev/null 2>&1
-record_defect 'base alias/oldname symlink is exposed as an installed rack' \
-  test -L "${case7}/user/Cellar/oldname"
+export HOMEBREW_PREFIX="${case7}/user"
+export HOMEBREW_OVERLAY_BASE_PREFIX="${case7}/base"
+homebrew-overlay-sync --force
+test ! -e "${case7}/user/Cellar/oldname"
+test ! -L "${case7}/user/Cellar/oldname"
+record_pass 'base alias/oldname symlink is not exposed as an installed rack'
 
-printf 'confirmed=%s expected=%s\n' "${confirmed}" "${expected}"
-test "${confirmed}" -eq "${expected}"
+printf 'passed=%s expected=%s\n' "${passed}" "${expected}"
+test "${passed}" -eq "${expected}"
