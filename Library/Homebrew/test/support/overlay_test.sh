@@ -73,6 +73,12 @@ test "$("${user_prefix}/bin/foo")" = base-foo
 test ! -e "${user_prefix}/bin/demo-cask"
 test ! -L "${user_prefix}/bin/demo-cask"
 
+external_rack="${work}/external-rack"
+mkdir -p "${external_rack}/1.0"
+ln -s "${external_rack}" "${user_prefix}/Cellar/external"
+homebrew-overlay-sync
+test -L "${user_prefix}/Cellar/external"
+
 # A real user rack shadows the administrator rack and its inherited links.
 rm "${user_prefix}/Cellar/foo"
 mkdir -p "${user_prefix}/Cellar/foo/2.0/bin"

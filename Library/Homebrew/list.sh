@@ -104,11 +104,22 @@ homebrew-list() {
     {
       if [[ -z "${cask}" && -d "${HOMEBREW_CELLAR}" ]]
       then
+        local overlay_base_cellar=""
+        if [[ -n "${HOMEBREW_OVERLAY_ACTIVE:-}" ]]
+        then
+          overlay_base_cellar="$(readlink -f "${HOMEBREW_OVERLAY_BASE_PREFIX%/}/Cellar" 2>/dev/null || true)"
+        fi
         local rack
         for rack in "${HOMEBREW_CELLAR}"/*
         do
           [[ -d "${rack}" ]] || continue
-          [[ -n "${HOMEBREW_OVERLAY_ACTIVE:-}" || ! -L "${rack}" ]] || continue
+          if [[ -L "${rack}" ]]
+          then
+            local rack_target=""
+            [[ -n "${overlay_base_cellar}" ]] || continue
+            rack_target="$(readlink -f "${rack}" 2>/dev/null || true)"
+            [[ "${rack_target}" == "${overlay_base_cellar}/"* ]] || continue
+          fi
           [[ "${rack##*/}" != .* ]] || continue
 
           local linked_version=""
