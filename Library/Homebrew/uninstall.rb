@@ -4,6 +4,7 @@
 require "dependents_message"
 require "installed_dependents"
 require "utils/output"
+require "overlay"
 
 module Homebrew
   # Helper module for uninstalling kegs.
@@ -20,6 +21,16 @@ module Homebrew
       ).void
     }
     def self.uninstall_kegs(kegs_by_rack, casks: [], force: false, ignore_dependencies: false, named_args: [])
+      if (inherited_keg = kegs_by_rack.values.flatten.find do |keg|
+        Homebrew::Overlay.inherited_keg?(keg.to_path)
+      end)
+        inherited_keg_path = Pathname(inherited_keg.to_path)
+        raise Homebrew::Overlay::InheritedKegError.new(
+          inherited_keg_path,
+          Homebrew::Overlay.base_prefix,
+        )
+      end
+
       handle_unsatisfied_dependents(kegs_by_rack,
                                     casks:,
                                     ignore_dependencies:,
@@ -58,7 +69,7 @@ module Homebrew
               rack = keg.rack
               rm_pin rack
 
-              if rack.directory?
+              if rack.directory? && !Homebrew::Overlay.inherited_rack?(rack)
                 versions = rack.subdirs.map(&:basename)
                 puts <<~EOS
                   #{keg.name} #{versions.to_sentence} #{versions.one? ? "is" : "are"} still installed.
@@ -109,7 +120,7 @@ module Homebrew
           end
         end
       end
-    rescue MultipleVersionsInstalledError => e
+    rescue MultipleVersionsInstalledError, Homebrew::Overlay::InheritedKegError => e
       ofail e
     ensure
       # If we delete Cellar/newname, then Cellar/oldname symlink

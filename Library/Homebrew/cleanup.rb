@@ -5,6 +5,7 @@ require "utils/bottles"
 require "utils/output"
 require "installed_dependents"
 require "stringio"
+require "overlay"
 
 require "formula"
 require "cask/cask_loader"
@@ -508,7 +509,7 @@ module Homebrew
       formula.eligible_kegs_for_cleanup(quiet:)
              .each { |keg| cleanup_keg(keg) }
       cleanup_cache_entries(formula_cache_paths(formula), type: nil, cleanup_unreferenced:)
-      rm_ds_store([formula.rack]) if ds_store
+      rm_ds_store([formula.rack]) if ds_store && !Homebrew::Overlay.inherited_rack?(formula.rack)
       cleanup_cache_db(formula.rack) if cache_db
       cleanup_lockfiles(FormulaLock.new(formula.name).path)
     end
@@ -552,6 +553,8 @@ module Homebrew
 
     sig { params(keg: Keg).void }
     def cleanup_keg(keg)
+      return if Homebrew::Overlay.inherited_keg?(keg.to_path)
+
       cleanup_path(Pathname.new(keg)) { keg.uninstall(raise_failures: true) }
     rescue Errno::EACCES, Errno::ENOTEMPTY => e
       opoo e.message
@@ -583,6 +586,8 @@ module Homebrew
       return unless HOMEBREW_CELLAR.directory?
 
       HOMEBREW_CELLAR.glob("*/*.reinstall").each do |reinstall_keg|
+        next if Homebrew::Overlay.inherited_keg?(reinstall_keg)
+
         cleanup_path(reinstall_keg) { FileUtils.rm_r(reinstall_keg) }
       end
     end
@@ -952,6 +957,9 @@ module Homebrew
       casks = Cask::Caskroom.casks
 
       removable_formulae = Utils::Autoremove.removable_formulae(formulae, casks)
+      removable_formulae.reject! do |formula|
+        formula.installed_kegs.any? { |keg| Homebrew::Overlay.inherited_keg?(keg.to_path) }
+      end
       if (candidate_kegs = removable_formulae.filter_map(&:any_installed_keg).presence) &&
          (required_kegs, = InstalledDependents.find_some_installed_dependents(candidate_kegs)) &&
          (required_names = Set.new(required_kegs.map(&:name)).presence)

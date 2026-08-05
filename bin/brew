@@ -178,6 +178,12 @@ then
   export_homebrew_env_file "/etc/homebrew/brew.env"
 fi
 
+# If explicitly enabled, redirect a user who cannot write the administrator
+# prefix into a native-layout per-user Homebrew prefix. Keep this before
+# environment filtering and in sync with Library/Homebrew/utils/overlay.sh.
+source "${HOMEBREW_REPOSITORY}/Library/Homebrew/utils/overlay.sh"
+homebrew-overlay-bootstrap "$@"
+
 # Use HOMEBREW_FORCE_BREW_WRAPPER if set.
 export HOMEBREW_ORIGINAL_BREW_FILE="${HOMEBREW_BREW_FILE}"
 if [[ -n "${HOMEBREW_FORCE_BREW_WRAPPER:-}" ]]

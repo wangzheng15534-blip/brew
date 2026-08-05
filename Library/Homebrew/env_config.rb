@@ -645,6 +645,27 @@ module Homebrew
                      "from homebrew-core.",
         boolean:     :set,
       },
+      HOMEBREW_OVERLAY:                          {
+        description: "If set, automatically use a native per-user Homebrew prefix when the administrator " \
+                     "prefix is readable but not writable.",
+        boolean:     true,
+      },
+      HOMEBREW_OVERLAY_ACTIVE:                   {
+        description: "Marks a Homebrew process as running from a per-user native-layout overlay prefix.",
+        boolean:     true,
+        hidden:      true,
+      },
+      HOMEBREW_OVERLAY_BASE_PREFIX:              {
+        description: "Use this read-only administrator Homebrew prefix as the lower package layer.",
+      },
+      HOMEBREW_OVERLAY_FORCE:                    {
+        description: "If set with `$HOMEBREW_OVERLAY`, use the per-user prefix even when the base is writable.",
+        boolean:     true,
+      },
+      HOMEBREW_OVERLAY_USER_PREFIX:              {
+        description:  "Use this native Homebrew prefix for the writable per-user overlay.",
+        default_text: "`$HOME/.linuxbrew`.",
+      },
       HOMEBREW_PIP_INDEX_URL:                    {
         description:  "If set, `brew install` <formula> will use this URL to download PyPI package resources.",
         default_text: "`https://pypi.org/simple`.",

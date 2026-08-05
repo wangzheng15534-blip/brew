@@ -2631,7 +2631,8 @@ class Formula
   def self.racks
     Formula.cache[:racks] ||= if HOMEBREW_CELLAR.directory?
       HOMEBREW_CELLAR.subdirs.reject do |rack|
-        rack.symlink? || rack.basename.to_s.start_with?(".") || rack.subdirs.empty?
+        (rack.symlink? && !Homebrew::Overlay.inherited_rack?(rack)) ||
+          rack.basename.to_s.start_with?(".") || rack.subdirs.empty?
       end
     else
       []
