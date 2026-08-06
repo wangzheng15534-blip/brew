@@ -1,5 +1,9 @@
 # Native overlay review results
 
+> **Historical results.** These checks describe an earlier reviewed tree.
+> Current corrections and acceptance limits are recorded in
+> [Final native-overlay review closure](Native-User-Overlay-Final-Review-Closure.md).
+
 ## Target before adding this review
 
 ```text

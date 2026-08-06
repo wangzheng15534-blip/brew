@@ -1,5 +1,10 @@
 # Native overlay review closure
 
+> **Superseded closure record.** This document closes the earlier R1–R12
+> review against an intermediate implementation. A later independent audit
+> reopened several areas. See the current
+> [Final native-overlay review closure](Native-User-Overlay-Final-Review-Closure.md).
+
 This document closes the findings recorded in
 [the rigorous review](Native-User-Overlay-Review.md). That review remains an
 unaltered historical record of the implementation at `18e50f0`. The corrected

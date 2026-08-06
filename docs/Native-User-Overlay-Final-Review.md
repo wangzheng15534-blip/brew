@@ -1,5 +1,10 @@
 # Final native overlay review
 
+> **Historical review.** This document assesses implementation commit
+> `3ec474c` and preserves the release-blocking findings that drove the
+> corrections. See the current
+> [Final native-overlay review closure](Native-User-Overlay-Final-Review-Closure.md).
+
 Review target:
 
 ```text

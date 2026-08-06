@@ -22,8 +22,10 @@ Documentation is grouped below by audience: users, contributors, maintainers and
 - [Command Not Found](Command-Not-Found.md)
 - [Homebrew on Linux](Homebrew-on-Linux.md)
 - [Native per-user overlay on Linux](Native-User-Overlay.md)
-- [Rigorous native overlay implementation review](Native-User-Overlay-Review.md)
-- [Native overlay review closure](Native-User-Overlay-Review-Closure.md)
+- [Final native-overlay review closure](Native-User-Overlay-Final-Review-Closure.md)
+- [Historical first native-overlay review](Native-User-Overlay-Review.md)
+- [Historical intermediate review closure](Native-User-Overlay-Review-Closure.md)
+- [Historical final implementation audit](Native-User-Overlay-Final-Review.md)
 - [Homebrew Bundle, `brew bundle` and `Brewfile`](Brew-Bundle-and-Brewfile.md)
 - [Homebrew MCP Server](MCP-Server.md)
 

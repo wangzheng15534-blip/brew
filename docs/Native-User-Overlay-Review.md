@@ -1,5 +1,9 @@
 # Rigorous review: Homebrew 6.0.15 native per-user overlay
 
+> **Historical review.** This document assesses the first native-overlay
+> prototype. See the current
+> [Final native-overlay review closure](Native-User-Overlay-Final-Review-Closure.md).
+
 ## Review target
 
 - Branch: `overlay-store`
