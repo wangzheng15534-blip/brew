@@ -118,6 +118,39 @@ RSpec.describe FormulaInstaller do
       expect { installer.finish }.to raise_error(error)
     end
 
+    it "commits an overlay replacement before native link side effects" do
+      formula = formula "overlay-commit-boundary" do
+        T.bind(self, T.class_of(Formula))
+        url "foo-1.0"
+      end
+      installer = described_class.new(formula)
+      keg = instance_double(Keg, tab: instance_double(Tab))
+      committed = false
+      transaction = instance_double(Homebrew::Overlay::FormulaTransaction)
+
+      installer.instance_variable_set(:@overlay_transaction, transaction)
+      allow(transaction).to receive(:finished?) { committed }
+      allow(Keg).to receive(:new).with(formula.prefix).and_return(keg)
+      allow(installer).to receive_messages(
+        fix_dynamic_linkage:                 nil,
+        only_deps?:                          false,
+        rollback_overlay_uncommitted_local_keg!: nil,
+        unlock:                              nil,
+        verbose?:                            false,
+        verify_overlay_base_generation!:     nil,
+      )
+
+      expect(transaction).to receive(:publish!).ordered
+      expect(installer).to receive(:fix_dynamic_linkage).with(keg).ordered
+      expect(transaction).to receive(:commit!).ordered do
+        committed = true
+      end
+      expect(installer).to receive(:link).with(keg).ordered.and_raise("link failed")
+      expect(transaction).not_to receive(:rollback!)
+
+      expect { installer.finish }.to raise_error("link failed")
+    end
+
     it "runs structured post-install work through the post-install subprocess" do
       formula = formula "finish-install-steps" do
         T.bind(self, T.class_of(Formula))

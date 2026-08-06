@@ -102,6 +102,9 @@ module Homebrew
       sig { returns(String) }
       attr_reader :base_generation
 
+      sig { returns(T::Boolean) }
+      def finished? = @finished
+
       sig { params(formula: T.untyped, base_generation: String).void }
       def initialize(formula, base_generation:)
         @formula_name = T.let(formula.name, String)

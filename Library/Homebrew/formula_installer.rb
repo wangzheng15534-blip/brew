@@ -670,7 +670,8 @@ on_request: installed_on_request?, options:)
     end_time = Time.now
     Homebrew.messages.package_installed(formula.name, end_time - start_time)
   rescue Exception # rubocop:disable Lint/RescueException
-    @overlay_transaction&.rollback!
+    transaction = @overlay_transaction
+    transaction.rollback! if transaction && !transaction.finished?
     rollback_overlay_uncommitted_local_keg!
     restore_overlay_failure_scope!
     raise
@@ -1030,13 +1031,20 @@ on_request: installed_on_request?, options:)
     Homebrew::Overlay.verify_base_generation!(generation) if generation
   end
 
+  sig { returns(T::Boolean) }
+  def overlay_package_committed?
+    @overlay_local_keg_committed || @overlay_transaction&.finished? || false
+  end
+
   sig { void }
   def raise_overlay_transaction_failure!
+    return if overlay_package_committed?
+
     verify_overlay_base_generation!
     return unless @overlay_transaction && Homebrew.failed?
 
     raise Homebrew::Overlay::TransactionFailure,
-          "#{formula.full_name} failed while replacing an inherited formula; the base version was restored"
+          "#{formula.full_name} failed before its private keg was committed; the base version was restored"
   end
 
   sig { void }
@@ -1066,6 +1074,29 @@ on_request: installed_on_request?, options:)
     verify_overlay_base_generation!
     @overlay_transaction&.publish!
     keg = Keg.new(formula.prefix)
+    overlay_managed_install = !@overlay_transaction.nil? || !@overlay_base_generation.nil?
+    fix_linkage = !@poured_bottle || !formula.bottle_specification.skip_relocation?(tab: keg.tab)
+
+    # The durable overlay package boundary deliberately precedes native link,
+    # service, etc/var, and formula post-install effects. Those operations can
+    # modify regular files or arbitrary paths and are not universally
+    # reversible. A later failure therefore leaves the private keg installed,
+    # matching native Homebrew's installed-but-unlinked/post-install-failed
+    # behavior instead of restoring the base rack beneath stale external state.
+    if overlay_managed_install
+      fix_dynamic_linkage(keg) if fix_linkage
+      raise_overlay_transaction_failure!
+      if @overlay_transaction
+        @overlay_transaction.commit!
+      elsif (generation = @overlay_base_generation)
+        Homebrew::Overlay.verify_base_generation!(generation)
+        Homebrew::Overlay.record_base_generation!(keg.to_path, generation)
+        Homebrew::Overlay.verify_base_generation!(generation)
+        @overlay_local_keg_committed = true
+        Homebrew::Overlay.bump_generation!
+      end
+    end
+
     link(keg)
     raise_overlay_transaction_failure!
     warning = link_manual_command_warning
@@ -1074,7 +1105,7 @@ on_request: installed_on_request?, options:)
     install_service
     raise_overlay_transaction_failure!
 
-    fix_dynamic_linkage(keg) if !@poured_bottle || !formula.bottle_specification.skip_relocation?(tab: keg.tab)
+    fix_dynamic_linkage(keg) if fix_linkage && !overlay_managed_install
     raise_overlay_transaction_failure!
 
     require "install"
@@ -1149,15 +1180,7 @@ on_request: installed_on_request?, options:)
     end
 
     raise_overlay_transaction_failure!
-    if @overlay_transaction
-      @overlay_transaction.commit!
-    elsif (generation = @overlay_base_generation)
-      Homebrew::Overlay.verify_base_generation!(generation)
-      Homebrew::Overlay.record_base_generation!(keg.to_path, generation)
-      Homebrew::Overlay.verify_base_generation!(generation)
-      @overlay_local_keg_committed = true
-    end
-    Homebrew::Overlay.bump_generation! unless @overlay_transaction
+    Homebrew::Overlay.bump_generation! unless overlay_managed_install
     self.class.installed << formula
 
     caveats
@@ -1165,7 +1188,8 @@ on_request: installed_on_request?, options:)
     ohai "Summary" if verbose? || show_summary_heading?
     puts summary
   rescue Exception # rubocop:disable Lint/RescueException
-    @overlay_transaction&.rollback!
+    transaction = @overlay_transaction
+    transaction.rollback! if transaction && !transaction.finished?
     rollback_overlay_uncommitted_local_keg!
     raise
   ensure
