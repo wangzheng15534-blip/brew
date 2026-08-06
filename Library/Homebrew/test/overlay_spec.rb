@@ -70,6 +70,17 @@ RSpec.describe Homebrew::Overlay do
     expect(transaction.staging_rack).to be_a_directory
     expect(user_cellar/"foo").to be_a_symlink
     expect((user_cellar/"foo").realpath).to eq(base_keg.parent)
+    pending_journal = transaction.transaction_dir.parent/".new-#{transaction.id}"
+    expect(pending_journal).not_to exist
+    expect(transaction.transaction_dir.stat.mode & 0777).to eq(0700)
+    expect(transaction.transaction_dir.children.map { |path| path.basename.to_s }.sort).to eq(
+      %w[base_generation formula state version],
+    )
+    transaction.transaction_dir.children.each do |path|
+      expect(path).to be_a_file
+      expect(path).not_to be_a_symlink
+      expect(path.stat.mode & 0777).to eq(0600)
+    end
     expect(transaction.transaction_dir/"state").to have_file_content("staging\n")
     expect(transaction.transaction_dir/"base_generation").to have_file_content("#{base_generation}\n")
   ensure

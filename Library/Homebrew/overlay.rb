@@ -118,6 +118,7 @@ module Homebrew
 
         @id = T.let("#{Process.pid}-#{SecureRandom.hex(12)}", String)
         @transaction_dir = T.let(Overlay.transactions_dir/@id, Pathname)
+        @pending_transaction_dir = T.let(Overlay.transactions_dir/".new-#{@id}", Pathname)
         @owner_lock_path = T.let(Overlay.transactions_dir/".locks"/"#{@id}.lock", Pathname)
         @owner_lock = T.let(nil, T.nilable(File))
         @staging_root = T.let(HOMEBREW_CELLAR/".homebrew-overlay-staging"/@id, Pathname)
@@ -133,23 +134,29 @@ module Homebrew
 
       sig { returns(FormulaTransaction) }
       def start!
-        raise "overlay transaction already exists: #{transaction_dir}" if transaction_dir.exist?
+        owns_mutation = false
+        if transaction_dir.exist? || transaction_dir.symlink? ||
+           @pending_transaction_dir.exist? || @pending_transaction_dir.symlink?
+          raise TransactionFailure, "overlay transaction already exists: #{transaction_dir}"
+        end
 
+        owns_mutation = !Overlay.mutation_active?
+        acquire_owner_lock!
+        Overlay.begin_mutation! if owns_mutation
         Overlay.verify_base_generation!(base_generation)
         Overlay.ensure_inherited_rack!(formula_name)
-        acquire_owner_lock!
-        Overlay.begin_mutation! unless Overlay.mutation_active?
+        publish_journal!
         Overlay.ensure_owned_directory!(staging_rack)
         staging_rack.chmod 0700
-        write_metadata("formula", formula_name)
-        write_metadata("version", version)
-        write_metadata("base_generation", base_generation)
-        write_state("staging")
         Overlay.register_transaction(self)
         self
       rescue Exception # rubocop:disable Lint/RescueException
         Overlay.unregister_transaction(formula_name, self)
-        cleanup_paths!
+        begin
+          cleanup_paths!
+        ensure
+          Overlay.sync!(mutation: true) if owns_mutation && Overlay.mutation_active?
+        end
         raise
       end
 
@@ -233,8 +240,10 @@ module Homebrew
 
       sig { void }
       def acquire_owner_lock!
-        raise TransactionFailure, "overlay transaction already exists: #{transaction_dir}" if
-          transaction_dir.exist? || transaction_dir.symlink?
+        if transaction_dir.exist? || transaction_dir.symlink? ||
+           @pending_transaction_dir.exist? || @pending_transaction_dir.symlink?
+          raise TransactionFailure, "overlay transaction already exists: #{transaction_dir}"
+        end
 
         lock_dir = @owner_lock_path.parent
         Overlay.ensure_owned_directory!(lock_dir)
@@ -250,9 +259,6 @@ module Homebrew
         unless owner_lock.flock(File::LOCK_EX | File::LOCK_NB)
           raise TransactionFailure, "could not acquire overlay transaction owner lock: #{@owner_lock_path}"
         end
-
-        Overlay.ensure_owned_directory!(transaction_dir)
-        transaction_dir.chmod 0700
       end
 
       sig { void }
@@ -265,11 +271,59 @@ module Homebrew
         @owner_lock = nil
       end
 
+      sig { params(directory: Pathname).void }
+      def fsync_directory!(directory)
+        File.open(directory, File::RDONLY | File::NOFOLLOW) { |file| file.fsync }
+      end
+
+      sig { params(directory: Pathname, name: String, value: String, exclusive: T::Boolean).void }
+      def write_metadata_at(directory, name, value, exclusive:)
+        path = directory/name
+        if exclusive
+          flags = File::WRONLY | File::CREAT | File::EXCL | File::NOFOLLOW
+          File.open(path, flags, 0600) do |file|
+            file.chmod 0600
+            file.write("#{value}\n")
+            file.flush
+            file.fsync
+          end
+        else
+          path.atomic_write("#{value}\n")
+          path.chmod 0600
+          File.open(path, File::RDONLY | File::NOFOLLOW) { |file| file.fsync }
+          fsync_directory!(directory)
+        end
+      end
+
+      # Build a complete journal under a hidden name, fsync it, then publish it
+      # with one directory rename. Recovery therefore sees either no journal or
+      # all required metadata; it never mistakes a process killed during setup
+      # for a corrupt visible transaction.
+      sig { void }
+      def publish_journal!
+        if transaction_dir.exist? || transaction_dir.symlink? ||
+           @pending_transaction_dir.exist? || @pending_transaction_dir.symlink?
+          raise TransactionFailure, "overlay transaction already exists: #{transaction_dir}"
+        end
+
+        Overlay.ensure_owned_directory!(@pending_transaction_dir)
+        @pending_transaction_dir.chmod 0700
+        write_metadata_at(@pending_transaction_dir, "formula", formula_name, exclusive: true)
+        write_metadata_at(@pending_transaction_dir, "version", version, exclusive: true)
+        write_metadata_at(@pending_transaction_dir, "base_generation", base_generation, exclusive: true)
+        write_metadata_at(@pending_transaction_dir, "state", "staging", exclusive: true)
+        fsync_directory!(@pending_transaction_dir)
+
+        raise TransactionFailure, "overlay transaction already exists: #{transaction_dir}" if
+          transaction_dir.exist? || transaction_dir.symlink?
+
+        File.rename(@pending_transaction_dir, transaction_dir)
+        fsync_directory!(Overlay.transactions_dir)
+      end
+
       sig { params(name: String, value: String).void }
       def write_metadata(name, value)
-        path = transaction_dir/name
-        path.atomic_write("#{value}\n")
-        path.chmod 0600
+        write_metadata_at(transaction_dir, name, value, exclusive: false)
       end
 
       sig { params(value: String).void }
@@ -359,7 +413,10 @@ module Homebrew
       def cleanup_paths!
         FileUtils.rm_rf(@staging_root) if @staging_root.exist?
         FileUtils.rm_rf(@replacement_root) if @replacement_root.exist? || @replacement_root.symlink?
-        FileUtils.rm_rf(transaction_dir) if transaction_dir.exist?
+        if @pending_transaction_dir.exist? || @pending_transaction_dir.symlink?
+          FileUtils.rm_rf(@pending_transaction_dir)
+        end
+        FileUtils.rm_rf(transaction_dir) if transaction_dir.exist? || transaction_dir.symlink?
         @owner_lock_path.unlink if @owner_lock_path.file? && !@owner_lock_path.symlink?
         @owner_lock_path.parent.rmdir_if_possible
         @staging_root.parent.rmdir_if_possible

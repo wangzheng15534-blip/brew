@@ -920,15 +920,65 @@ homebrew-overlay-recover-formula-transactions() {
   local prefix="$1"
   local base_prefix="$2"
   local transactions="${prefix}/var/homebrew/overlay/transactions"
-  local transaction id formula version state base_generation base_rack local_rack final_version
+  local transaction pending_name id formula version state base_generation base_rack local_rack final_version
   local staging_root staging_version replacement_root replacement_rack replacement_version
   local failed_root failed_rack failed_version final_marker replacement_marker failed_marker
   local base_generation_marker recorded_generation final_marker_id replacement_marker_id failed_marker_id
-  local owner_lock owner_lock_fd
+  local owner_lock owner_lock_fd lock_dir
 
   HOMEBREW_OVERLAY_FORMULA_RECOVERED=0
   HOMEBREW_OVERLAY_FORMULA_ACTIVE=0
   homebrew-overlay-safe-mkdir "${prefix}" "${transactions}" || return 1
+  lock_dir="${transactions}/.locks"
+  homebrew-overlay-safe-mkdir "${prefix}" "${lock_dir}" || return 1
+
+  # FormulaTransaction publishes journals by renaming a complete hidden
+  # .new-<id> directory to <id>. A crash before that rename may leave only the
+  # hidden directory and transaction-owned staging paths. They are recoverable
+  # only after the owner lock becomes available; a live pending transaction
+  # blocks startup rather than being mistaken for abandoned work.
+  for transaction in "${transactions}"/.new-*
+  do
+    [[ -e "${transaction}" || -L "${transaction}" ]] || continue
+    if [[ ! -d "${transaction}" || -L "${transaction}" || ! -O "${transaction}" ]]
+    then
+      echo "Error: unsafe pending overlay transaction entry: ${transaction}" >&2
+      return 1
+    fi
+    pending_name="${transaction##*/}"
+    id="${pending_name#.new-}"
+    [[ -n "${id}" && "${pending_name}" == ".new-${id}" && "${id}" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+    homebrew-overlay-valid-relative-path "${id}" || return 1
+    [[ "${id}" != */* ]] || return 1
+    owner_lock="${lock_dir}/${id}.lock"
+    if [[ ! -e "${owner_lock}" && ! -L "${owner_lock}" ]]
+    then
+      (umask 077; set -o noclobber; : >"${owner_lock}") 2>/dev/null || true
+    fi
+    [[ -f "${owner_lock}" && ! -L "${owner_lock}" && -O "${owner_lock}" ]] || {
+      echo "Error: unsafe pending overlay transaction owner lock: ${owner_lock}" >&2
+      return 1
+    }
+    exec {owner_lock_fd}<>"${owner_lock}" || return 1
+    if ! flock -x -n "${owner_lock_fd}"
+    then
+      HOMEBREW_OVERLAY_FORMULA_ACTIVE=1
+      exec {owner_lock_fd}>&-
+      continue
+    fi
+
+    HOMEBREW_OVERLAY_FORMULA_RECOVERED=1
+    staging_root="${prefix}/Cellar/.homebrew-overlay-staging/${id}"
+    replacement_root="${prefix}/Cellar/.homebrew-overlay-racks/${id}"
+    failed_root="${prefix}/Cellar/.homebrew-overlay-failed/${id}"
+    homebrew-overlay-path-under "${staging_root}" "${prefix}/Cellar/.homebrew-overlay-staging" || return 1
+    homebrew-overlay-path-under "${replacement_root}" "${prefix}/Cellar/.homebrew-overlay-racks" || return 1
+    homebrew-overlay-path-under "${failed_root}" "${prefix}/Cellar/.homebrew-overlay-failed" || return 1
+    rm -rf --one-file-system -- "${staging_root}" "${replacement_root}" "${failed_root}" "${transaction}" || return 1
+    rm -f -- "${owner_lock}" || return 1
+    exec {owner_lock_fd}>&-
+  done
+
   for transaction in "${transactions}"/*
   do
     [[ -e "${transaction}" || -L "${transaction}" ]] || continue
@@ -1107,6 +1157,40 @@ homebrew-overlay-recover-formula-transactions() {
     rm -f -- "${owner_lock}" || return 1
     exec {owner_lock_fd}>&-
   done
+
+  # A process can die after acquiring its owner lock but before publishing even
+  # a hidden journal. Remove only unlocked lock files that have neither a
+  # visible nor a pending journal; a live pre-journal owner keeps startup
+  # blocked until it completes or exits.
+  for owner_lock in "${lock_dir}"/*.lock
+  do
+    [[ -e "${owner_lock}" || -L "${owner_lock}" ]] || continue
+    [[ -f "${owner_lock}" && ! -L "${owner_lock}" && -O "${owner_lock}" ]] || {
+      echo "Error: unsafe orphan overlay transaction owner lock: ${owner_lock}" >&2
+      return 1
+    }
+    id="${owner_lock##*/}"
+    id="${id%.lock}"
+    [[ -n "${id}" && "${id}" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+    homebrew-overlay-valid-relative-path "${id}" || return 1
+    [[ "${id}" != */* ]] || return 1
+    if [[ -e "${transactions}/${id}" || -L "${transactions}/${id}" ||
+          -e "${transactions}/.new-${id}" || -L "${transactions}/.new-${id}" ]]
+    then
+      continue
+    fi
+    exec {owner_lock_fd}<>"${owner_lock}" || return 1
+    if ! flock -x -n "${owner_lock_fd}"
+    then
+      HOMEBREW_OVERLAY_FORMULA_ACTIVE=1
+      exec {owner_lock_fd}>&-
+      continue
+    fi
+    HOMEBREW_OVERLAY_FORMULA_RECOVERED=1
+    rm -f -- "${owner_lock}" || return 1
+    exec {owner_lock_fd}>&-
+  done
+  rmdir "${lock_dir}" 2>/dev/null || true
   rmdir "${prefix}/Cellar/.homebrew-overlay-staging" \
         "${prefix}/Cellar/.homebrew-overlay-racks" \
         "${prefix}/Cellar/.homebrew-overlay-failed" 2>/dev/null || true

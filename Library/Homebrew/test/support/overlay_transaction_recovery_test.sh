@@ -57,6 +57,88 @@ activate() {
 }
 
 
+# Journal creation is atomic: a hidden pending directory is never interpreted
+# as a visible, corrupt transaction. A live owner preserves it and blocks
+# startup; after the owner exits, recovery removes the pending journal and all
+# transaction-owned staging paths.
+pending_case="${work}/pending-owner"
+make_case "${pending_case}"
+mkdir -p \
+  "${pending_case}/user/var/homebrew/overlay/transactions/.new-txn-pending" \
+  "${pending_case}/user/var/homebrew/overlay/transactions/.locks" \
+  "${pending_case}/user/Cellar/.homebrew-overlay-staging/txn-pending/foo/2.0" \
+  "${pending_case}/user/Cellar/.homebrew-overlay-racks/txn-pending/foo" \
+  "${pending_case}/user/Cellar/.homebrew-overlay-failed/txn-pending/foo"
+: >"${pending_case}/user/var/homebrew/overlay/transactions/.locks/txn-pending.lock"
+pending_ready="${pending_case}/owner-ready"
+pending_lock="${pending_case}/user/var/homebrew/overlay/transactions/.locks/txn-pending.lock"
+python3 - "${pending_lock}" "${pending_ready}" <<'PY_PENDING_OWNER' &
+import fcntl
+import pathlib
+import sys
+import time
+
+lock_path = pathlib.Path(sys.argv[1])
+ready_path = pathlib.Path(sys.argv[2])
+with lock_path.open("r+") as lock:
+    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    ready_path.write_text("ready\n", encoding="utf-8")
+    time.sleep(120)
+PY_PENDING_OWNER
+owner_pid=$!
+for _ in {1..100}
+do
+  [[ -f "${pending_ready}" ]] && break
+  sleep 0.01
+done
+test -f "${pending_ready}"
+activate "${pending_case}"
+if homebrew-overlay-sync --force >"${pending_case}/stdout" 2>"${pending_case}/stderr"
+then
+  echo "live pending overlay transaction unexpectedly synchronized" >&2
+  exit 1
+fi
+test -d "${pending_case}/user/var/homebrew/overlay/transactions/.new-txn-pending"
+test -d "${pending_case}/user/Cellar/.homebrew-overlay-staging/txn-pending"
+grep -q 'transaction is still active' "${pending_case}/stderr"
+kill "${owner_pid}" 2>/dev/null || true
+wait "${owner_pid}" 2>/dev/null || true
+owner_pid=""
+homebrew-overlay-sync --force
+test ! -e "${pending_case}/user/var/homebrew/overlay/transactions/.new-txn-pending"
+test ! -e "${pending_case}/user/var/homebrew/overlay/transactions/.locks/txn-pending.lock"
+test ! -e "${pending_case}/user/Cellar/.homebrew-overlay-staging/txn-pending"
+test ! -e "${pending_case}/user/Cellar/.homebrew-overlay-racks/txn-pending"
+test ! -e "${pending_case}/user/Cellar/.homebrew-overlay-failed/txn-pending"
+
+# A process may die after acquiring its owner lock but before creating even a
+# hidden journal. An unlocked orphan is cleaned; a malformed visible journal
+# remains a hard error rather than being silently discarded.
+orphan_case="${work}/orphan-owner-lock"
+make_case "${orphan_case}"
+mkdir -p "${orphan_case}/user/var/homebrew/overlay/transactions/.locks"
+: >"${orphan_case}/user/var/homebrew/overlay/transactions/.locks/txn-orphan.lock"
+activate "${orphan_case}"
+homebrew-overlay-sync --force
+test ! -e "${orphan_case}/user/var/homebrew/overlay/transactions/.locks/txn-orphan.lock"
+
+incomplete_case="${work}/incomplete-visible-journal"
+make_case "${incomplete_case}"
+mkdir -p \
+  "${incomplete_case}/user/var/homebrew/overlay/transactions/txn-incomplete" \
+  "${incomplete_case}/user/var/homebrew/overlay/transactions/.locks"
+: >"${incomplete_case}/user/var/homebrew/overlay/transactions/txn-incomplete/formula"
+printf 'foo\n' >"${incomplete_case}/user/var/homebrew/overlay/transactions/txn-incomplete/formula"
+: >"${incomplete_case}/user/var/homebrew/overlay/transactions/.locks/txn-incomplete.lock"
+activate "${incomplete_case}"
+if homebrew-overlay-sync --force >"${incomplete_case}/stdout" 2>"${incomplete_case}/stderr"
+then
+  echo "incomplete visible overlay transaction unexpectedly synchronized" >&2
+  exit 1
+fi
+test -d "${incomplete_case}/user/var/homebrew/overlay/transactions/txn-incomplete"
+grep -q 'incomplete overlay formula transaction' "${incomplete_case}/stderr"
+
 # A live transaction owns a dedicated advisory lock. Startup must fail without
 # touching its journal or staging tree; after the owner exits, normal recovery
 # may remove the abandoned transaction.
@@ -220,5 +302,27 @@ fi
 test -d "${case7}/user/Cellar/foo/2.0"
 test -d "${case7}/user/var/homebrew/overlay/transactions/txn-generation"
 grep -q 'wrong base generation' "${case7}/stderr"
+
+python3 - "${repo}/Library/Homebrew/overlay.rb" <<'PY_ORDER'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+start = source.index("      def start!\n")
+finish = source.index("      sig { void }\n      def publish!", start)
+body = source[start:finish]
+expected = [
+    "acquire_owner_lock!",
+    "Overlay.begin_mutation!",
+    "Overlay.verify_base_generation!",
+    "Overlay.ensure_inherited_rack!",
+    "publish_journal!",
+    "Overlay.ensure_owned_directory!(staging_rack)",
+]
+positions = [body.index(item) for item in expected]
+assert positions == sorted(positions), positions
+assert "write_metadata_at(@pending_transaction_dir" in source
+assert "File.rename(@pending_transaction_dir, transaction_dir)" in source
+PY_ORDER
 
 printf 'overlay transaction recovery test: PASS\n'
