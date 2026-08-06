@@ -118,6 +118,23 @@ RSpec.describe FormulaInstaller do
       expect { installer.finish }.to raise_error(error)
     end
 
+    it "raises on a non-raising local overlay failure before commit" do
+      formula = formula "overlay-local-failure" do
+        T.bind(self, T.class_of(Formula))
+        url "foo-1.0"
+      end
+      installer = described_class.new(formula)
+      installer.instance_variable_set(:@overlay_base_generation, "a" * 64)
+      allow(installer).to receive(:verify_overlay_base_generation!)
+      Homebrew.failed = true
+
+      expect do
+        installer.send(:raise_overlay_transaction_failure!)
+      end.to raise_error(Homebrew::Overlay::TransactionFailure, /uncommitted package state was discarded/)
+    ensure
+      Homebrew.failed = false
+    end
+
     it "commits an overlay replacement before native link side effects" do
       formula = formula "overlay-commit-boundary" do
         T.bind(self, T.class_of(Formula))

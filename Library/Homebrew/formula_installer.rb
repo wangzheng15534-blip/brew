@@ -606,7 +606,7 @@ class FormulaInstaller
     if Homebrew::EnvConfig.overlay? && !Homebrew::Overlay.mutation_active?
       Homebrew::Overlay.begin_mutation!
     end
-    if @overlay_transaction
+    if @overlay_base_generation
       @overlay_previous_failed = Homebrew.failed?
       Homebrew.failed = false
     end
@@ -669,7 +669,7 @@ on_request: installed_on_request?, options:)
 
     opoo "Nothing was installed to #{formula.prefix}" unless formula.latest_version_installed?
     verify_overlay_base_generation!
-    raise_overlay_transaction_failure! if @overlay_transaction
+    raise_overlay_transaction_failure! if @overlay_base_generation
     end_time = Time.now
     Homebrew.messages.package_installed(formula.name, end_time - start_time)
   rescue Exception # rubocop:disable Lint/RescueException
@@ -1042,12 +1042,13 @@ on_request: installed_on_request?, options:)
   sig { void }
   def raise_overlay_transaction_failure!
     return if overlay_package_committed?
+    return unless @overlay_base_generation
 
     verify_overlay_base_generation!
-    return unless @overlay_transaction && Homebrew.failed?
+    return unless Homebrew.failed?
 
     raise Homebrew::Overlay::TransactionFailure,
-          "#{formula.full_name} failed before its private keg was committed; the base version was restored"
+          "#{formula.full_name} failed before its private keg was committed; uncommitted package state was discarded"
   end
 
   sig { void }

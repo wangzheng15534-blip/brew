@@ -27,12 +27,28 @@ if positions != sorted(positions) or len(set(positions)) != len(positions):
 
 required = [
     "return if overlay_package_committed?",
+    "return unless @overlay_base_generation",
+    "return unless Homebrew.failed?",
+    "uncommitted package state was discarded",
     "transaction.rollback! if transaction && !transaction.finished?",
     "matching native Homebrew's installed-but-unlinked/post-install-failed",
 ]
 for fragment in required:
     if fragment not in source:
         raise SystemExit(f"missing overlay commit-boundary guard: {fragment}")
+
+install_start = source.index("  def install\n")
+install_end = source.index("\n  sig { void }\n  def check_conflicts", install_start)
+install = source[install_start:install_end]
+isolation_order = [
+    "if @overlay_base_generation",
+    "@overlay_previous_failed = Homebrew.failed?",
+    "Homebrew.failed = false",
+    "raise_overlay_transaction_failure! if @overlay_base_generation",
+]
+isolation_positions = [install.index(fragment) for fragment in isolation_order]
+if isolation_positions != sorted(isolation_positions):
+    raise SystemExit(f"overlay non-raising failure isolation is out of order: {list(zip(isolation_order, isolation_positions))}")
 PY
 
 printf 'overlay commit boundary test: PASS\n'
