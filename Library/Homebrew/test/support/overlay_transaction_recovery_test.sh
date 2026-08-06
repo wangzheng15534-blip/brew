@@ -8,7 +8,16 @@ repo="$(cd "${repo}" && pwd -P)"
 source "${repo}/Library/Homebrew/utils/overlay.sh"
 
 work="$(mktemp -d "${TMPDIR:-/tmp}/homebrew-overlay-transaction.XXXXXX")"
-trap 'rm -rf "${work}"' EXIT
+owner_pid=""
+cleanup() {
+  if [[ -n "${owner_pid}" ]] && kill -0 "${owner_pid}" 2>/dev/null
+  then
+    kill "${owner_pid}" 2>/dev/null || true
+    wait "${owner_pid}" 2>/dev/null || true
+  fi
+  rm -rf "${work}"
+}
+trap cleanup EXIT
 make_case() {
   local root="$1"
   mkdir -p \
@@ -46,6 +55,56 @@ activate() {
   export HOMEBREW_OVERLAY=1
   export HOMEBREW_OVERLAY_ACTIVE=1
 }
+
+
+# A live transaction owns a dedicated advisory lock. Startup must fail without
+# touching its journal or staging tree; after the owner exits, normal recovery
+# may remove the abandoned transaction.
+case0="${work}/live-owner"
+make_case "${case0}"
+write_journal "${case0}" txn-live staging
+mkdir -p "${case0}/user/Cellar/.homebrew-overlay-staging/txn-live/foo/2.0" \
+         "${case0}/user/var/homebrew/overlay/transactions/.locks"
+: >"${case0}/user/var/homebrew/overlay/transactions/.locks/txn-live.lock"
+ready="${case0}/owner-ready"
+python3 - "${case0}/user/var/homebrew/overlay/transactions/.locks/txn-live.lock" "${ready}" <<'PY_OWNER' &
+import fcntl
+import pathlib
+import sys
+import time
+
+lock_path = pathlib.Path(sys.argv[1])
+ready_path = pathlib.Path(sys.argv[2])
+with lock_path.open("r+") as lock:
+    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    ready_path.write_text("ready\n", encoding="utf-8")
+    time.sleep(120)
+PY_OWNER
+owner_pid=$!
+for _ in {1..100}
+do
+  [[ -f "${ready}" ]] && break
+  sleep 0.01
+done
+test -f "${ready}"
+activate "${case0}"
+if homebrew-overlay-sync --force >"${case0}/stdout" 2>"${case0}/stderr"
+then
+  echo "live overlay transaction unexpectedly synchronized" >&2
+  exit 1
+fi
+test -d "${case0}/user/var/homebrew/overlay/transactions/txn-live"
+test -d "${case0}/user/Cellar/.homebrew-overlay-staging/txn-live"
+grep -q 'transaction is still active' "${case0}/stderr"
+HOMEBREW_OVERLAY_OWNER_TRANSACTION_ID=txn-live homebrew-overlay-sync --force
+test -d "${case0}/user/var/homebrew/overlay/transactions/txn-live"
+test -d "${case0}/user/Cellar/.homebrew-overlay-staging/txn-live"
+kill "${owner_pid}" 2>/dev/null || true
+wait "${owner_pid}" 2>/dev/null || true
+owner_pid=""
+homebrew-overlay-sync --force
+test ! -e "${case0}/user/var/homebrew/overlay/transactions/txn-live"
+test ! -e "${case0}/user/Cellar/.homebrew-overlay-staging/txn-live"
 
 # Staging never changed the active rack.
 case1="${work}/staging"

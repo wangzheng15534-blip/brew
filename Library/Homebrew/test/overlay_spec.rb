@@ -59,6 +59,9 @@ RSpec.describe Homebrew::Overlay do
     base_keg = add_base_formula("foo", "1.0")
     transaction = T.must(described_class.begin_formula_transaction(formula, base_generation:))
 
+    owner_lock = prefix/"var/homebrew/overlay/transactions/.locks/#{transaction.id}.lock"
+    expect(owner_lock).to be_a_file
+    expect(system("flock", "-xn", owner_lock.to_s, "-c", "true", out: File::NULL, err: File::NULL)).to be(false)
     expect(described_class.install_rack("foo")).to eq(transaction.staging_rack)
     expect(transaction.staging_rack).to be_a_directory
     expect(user_cellar/"foo").to be_a_symlink

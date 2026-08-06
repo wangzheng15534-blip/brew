@@ -113,6 +113,8 @@ module Homebrew
 
         @id = T.let("#{Process.pid}-#{SecureRandom.hex(12)}", String)
         @transaction_dir = T.let(Overlay.transactions_dir/@id, Pathname)
+        @owner_lock_path = T.let(Overlay.transactions_dir/".locks"/"#{@id}.lock", Pathname)
+        @owner_lock = T.let(nil, T.nilable(File))
         @staging_root = T.let(HOMEBREW_CELLAR/".homebrew-overlay-staging"/@id, Pathname)
         @staging_rack = T.let(@staging_root/@formula_name, Pathname)
         @staging_version = T.let(@staging_rack/@version, Pathname)
@@ -130,8 +132,7 @@ module Homebrew
 
         Overlay.verify_base_generation!(base_generation)
         Overlay.ensure_inherited_rack!(formula_name)
-        transaction_dir.mkpath
-        transaction_dir.chmod 0700
+        acquire_owner_lock!
         staging_rack.mkpath
         staging_rack.chmod 0700
         write_metadata("formula", formula_name)
@@ -182,7 +183,7 @@ module Homebrew
         write_state("committed")
         @finished = true
         Overlay.clear_caches!
-        Overlay.sync!(mutation: true)
+        Overlay.sync!(mutation: true, owner_transaction_id: id)
         cleanup_paths!
       end
 
@@ -200,7 +201,7 @@ module Homebrew
         end
 
         Overlay.clear_caches!
-        Overlay.sync!(mutation: true)
+        Overlay.sync!(mutation: true, owner_transaction_id: id)
         cleanup_paths!
         @finished = true
       end
@@ -222,6 +223,46 @@ module Homebrew
       def transaction_owns_replacement?
         candidate = replacement_rack/version
         candidate.directory? && !candidate.symlink? && marker_owned?(candidate)
+      end
+
+      sig { void }
+      def acquire_owner_lock!
+        raise TransactionFailure, "overlay transaction already exists: #{transaction_dir}" if
+          transaction_dir.exist? || transaction_dir.symlink?
+
+        lock_dir = @owner_lock_path.parent
+        lock_dir.mkpath
+        unless lock_dir.directory? && !lock_dir.symlink? && lock_dir.stat.uid == Process.uid
+          raise TransactionFailure, "unsafe overlay transaction lock directory: #{lock_dir}"
+        end
+        lock_dir.chmod 0700
+        if @owner_lock_path.symlink? || @owner_lock_path.exist?
+          raise TransactionFailure, "overlay transaction owner lock already exists: #{@owner_lock_path}"
+        end
+
+        flags = File::RDWR | File::CREAT | File::EXCL | File::NOFOLLOW
+        owner_lock = File.open(@owner_lock_path, flags, 0600)
+        @owner_lock = owner_lock
+        owner_lock.close_on_exec = true
+        unless owner_lock.flock(File::LOCK_EX | File::LOCK_NB)
+          raise TransactionFailure, "could not acquire overlay transaction owner lock: #{@owner_lock_path}"
+        end
+
+        transaction_dir.mkpath
+        unless transaction_dir.directory? && !transaction_dir.symlink? && transaction_dir.stat.uid == Process.uid
+          raise TransactionFailure, "unsafe overlay transaction directory: #{transaction_dir}"
+        end
+        transaction_dir.chmod 0700
+      end
+
+      sig { void }
+      def release_owner_lock!
+        owner_lock = @owner_lock
+        return if owner_lock.nil?
+
+        owner_lock.flock(File::LOCK_UN) unless owner_lock.closed?
+        owner_lock.close unless owner_lock.closed?
+        @owner_lock = nil
       end
 
       sig { params(name: String, value: String).void }
@@ -319,8 +360,12 @@ module Homebrew
         FileUtils.rm_rf(@staging_root) if @staging_root.exist?
         FileUtils.rm_rf(@replacement_root) if @replacement_root.exist? || @replacement_root.symlink?
         FileUtils.rm_rf(transaction_dir) if transaction_dir.exist?
+        @owner_lock_path.unlink if @owner_lock_path.file? && !@owner_lock_path.symlink?
+        @owner_lock_path.parent.rmdir_if_possible
         @staging_root.parent.rmdir_if_possible
         @replacement_root.parent.rmdir_if_possible
+      ensure
+        release_owner_lock!
       end
     end
 
@@ -770,13 +815,17 @@ module Homebrew
       Homebrew.safe_system "/bin/bash", script, "--bump-generation", HOMEBREW_PREFIX.to_s
     end
 
-    sig { params(mutation: T::Boolean).void }
-    def self.sync!(mutation: false)
+    sig { params(mutation: T::Boolean, owner_transaction_id: T.nilable(String)).void }
+    def self.sync!(mutation: false, owner_transaction_id: nil)
       return unless active?
 
       bump_generation! if mutation
       script = HOMEBREW_LIBRARY_PATH/"utils/overlay.sh"
-      Homebrew.safe_system "/bin/bash", script, "--sync"
+      environment = T.let({}, T::Hash[String, T.nilable(String)])
+      if owner_transaction_id
+        environment["HOMEBREW_OVERLAY_OWNER_TRANSACTION_ID"] = owner_transaction_id
+      end
+      Homebrew.safe_system environment, "/bin/bash", script, "--sync"
       @link_state_entries = nil
     end
 

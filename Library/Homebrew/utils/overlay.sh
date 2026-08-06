@@ -266,7 +266,7 @@ homebrew-overlay-initialize-prefix() {
   for directory in \
     bin Caskroom Cellar etc/homebrew Frameworks include lib opt sbin share \
     var/homebrew/linked var/homebrew/locks var/homebrew/overlay/transactions \
-    var/homebrew/overlay/sync
+    var/homebrew/overlay/transactions/.locks var/homebrew/overlay/sync
   do
     homebrew-overlay-safe-mkdir "${prefix}" "${prefix}/${directory}" || {
       echo "Error: unsafe path inside user overlay prefix: ${prefix}/${directory}" >&2
@@ -770,13 +770,14 @@ homebrew-overlay-recover-formula-transactions() {
   local staging_root staging_version replacement_root replacement_rack replacement_version
   local failed_root failed_rack failed_version final_marker replacement_marker failed_marker
   local base_generation_marker recorded_generation final_marker_id replacement_marker_id failed_marker_id
+  local owner_lock owner_lock_fd
 
   HOMEBREW_OVERLAY_FORMULA_RECOVERED=0
+  HOMEBREW_OVERLAY_FORMULA_ACTIVE=0
   homebrew-overlay-safe-mkdir "${prefix}" "${transactions}" || return 1
   for transaction in "${transactions}"/*
   do
     [[ -e "${transaction}" || -L "${transaction}" ]] || continue
-    HOMEBREW_OVERLAY_FORMULA_RECOVERED=1
     if [[ ! -d "${transaction}" || -L "${transaction}" ]]
     then
       echo "Error: unsafe overlay transaction entry: ${transaction}" >&2
@@ -784,6 +785,28 @@ homebrew-overlay-recover-formula-transactions() {
     fi
     id="${transaction##*/}"
     [[ "${id}" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+    owner_lock="${transactions}/.locks/${id}.lock"
+    homebrew-overlay-safe-mkdir "${prefix}" "${owner_lock%/*}" || return 1
+    if [[ ! -e "${owner_lock}" && ! -L "${owner_lock}" ]]
+    then
+      (umask 077; set -o noclobber; : >"${owner_lock}") 2>/dev/null || true
+    fi
+    [[ -f "${owner_lock}" && ! -L "${owner_lock}" && -O "${owner_lock}" ]] || {
+      echo "Error: unsafe overlay transaction owner lock: ${owner_lock}" >&2
+      return 1
+    }
+    exec {owner_lock_fd}<>"${owner_lock}" || return 1
+    if ! flock -x -n "${owner_lock_fd}"
+    then
+      if [[ "${id}" != "${HOMEBREW_OVERLAY_OWNER_TRANSACTION_ID:-}" ]]
+      then
+        HOMEBREW_OVERLAY_FORMULA_ACTIVE=1
+      fi
+      exec {owner_lock_fd}>&-
+      continue
+    fi
+    HOMEBREW_OVERLAY_FORMULA_RECOVERED=1
+
     [[ -f "${transaction}/formula" && ! -L "${transaction}/formula" &&
        -f "${transaction}/version" && ! -L "${transaction}/version" &&
        -f "${transaction}/base_generation" && ! -L "${transaction}/base_generation" &&
@@ -922,6 +945,8 @@ homebrew-overlay-recover-formula-transactions() {
     homebrew-overlay-path-under "${replacement_root}" "${prefix}/Cellar/.homebrew-overlay-racks" || return 1
     homebrew-overlay-path-under "${failed_root}" "${prefix}/Cellar/.homebrew-overlay-failed" || return 1
     rm -rf --one-file-system -- "${staging_root}" "${replacement_root}" "${failed_root}" "${transaction}" || return 1
+    rm -f -- "${owner_lock}" || return 1
+    exec {owner_lock_fd}>&-
   done
   rmdir "${prefix}/Cellar/.homebrew-overlay-staging" \
         "${prefix}/Cellar/.homebrew-overlay-racks" \
@@ -953,6 +978,11 @@ homebrew-overlay-sync-unlocked() {
   stamp_file="${state_dir}/view.stamp"
   homebrew-overlay-safe-mkdir "${prefix}" "${state_dir}" || return 1
   homebrew-overlay-recover-formula-transactions "${prefix}" "${base_prefix}" || return 1
+  if [[ "${HOMEBREW_OVERLAY_FORMULA_ACTIVE:-0}" -eq 1 ]]
+  then
+    echo "Error: another Homebrew overlay formula transaction is still active; retry after it finishes" >&2
+    return 1
+  fi
   homebrew-overlay-recover-sync "${prefix}" || return 1
 
   if [[ "${HOMEBREW_OVERLAY_FORMULA_RECOVERED:-0}" -eq 1 ]]
