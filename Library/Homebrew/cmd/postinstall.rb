@@ -27,6 +27,7 @@ module Homebrew
         end
 
         formulae.each do |f|
+          Homebrew::Overlay.begin_mutation!
           ohai "Postinstalling #{f}"
           f.install_etc_var
           post_install_steps_defined = f.post_install_steps_defined?

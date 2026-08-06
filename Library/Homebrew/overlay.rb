@@ -18,6 +18,8 @@ module Homebrew
 
     @link_state_entries = T.let(nil, T.nilable(T::Hash[String, String]))
     @install_transactions = T.let({}, T::Hash[String, T.untyped])
+    @mutation_lock = T.let(nil, T.nilable(File))
+    @mutation_owner = T.let(nil, T.nilable(String))
 
     class InheritedKegError < RuntimeError
       extend T::Sig
@@ -136,6 +138,7 @@ module Homebrew
         Overlay.verify_base_generation!(base_generation)
         Overlay.ensure_inherited_rack!(formula_name)
         acquire_owner_lock!
+        Overlay.begin_mutation! unless Overlay.mutation_active?
         staging_rack.mkpath
         staging_rack.chmod 0700
         write_metadata("formula", formula_name)
@@ -706,6 +709,7 @@ module Homebrew
         raise TransactionFailure, "refusing to discard a local keg not owned by the current user: #{keg}"
       end
 
+      begin_mutation! unless mutation_active?
       remove_links_to!(keg)
       FileUtils.rm_rf(keg)
       raise TransactionFailure, "could not discard failed local keg: #{keg}" if keg.exist? || keg.symlink?
@@ -753,17 +757,6 @@ module Homebrew
       active? && path_under?(path.expand_path, HOMEBREW_PREFIX.expand_path)
     end
 
-    sig { params(formula_name: String).returns(T::Boolean) }
-    def self.restore_inherited_rack!(formula_name)
-      return false unless active?
-      return false if local_realizations?(formula_name)
-      base_rack = base_cellar/formula_name
-      return false unless base_rack.directory? && !base_rack.symlink?
-
-      sync!(mutation: true)
-      true
-    end
-
     sig { returns(Pathname) }
     def self.link_state_file
       HOMEBREW_PREFIX/"var/homebrew/overlay/view.state"
@@ -807,30 +800,116 @@ module Homebrew
       true
     end
 
-    # Advance the native prefix's explicit package generation. The generation
-    # is consumed by non-admin overlay startup to avoid recursively scanning the
-    # administrator and user Cellars on every read-only invocation.
+    sig { returns(T::Boolean) }
+    def self.mutation_active? = !@mutation_lock.nil?
+
+    # Serialize native package mutations and publish a durable dirty marker
+    # before the first filesystem change. The advisory lock remains held by the
+    # Ruby process until the generation is bumped or a mutation sync completes.
+    # A concurrent brew invocation therefore refuses to bless a transient
+    # Cellar, while a crashed process releases the lock but leaves the marker for
+    # structural recovery on the next invocation.
+    sig { void }
+    def self.begin_mutation!
+      return unless Homebrew::EnvConfig.overlay?
+
+      return if @mutation_lock
+
+      lock_path = HOMEBREW_PREFIX/"var/homebrew/locks/overlay-mutation.lock"
+      lock_dir = lock_path.parent
+      lock_dir.mkpath
+      unless lock_dir.directory? && !lock_dir.symlink? && lock_dir.stat.uid == Process.uid
+        raise TransactionFailure, "unsafe overlay mutation lock directory: #{lock_dir}"
+      end
+      if lock_path.symlink? || (lock_path.exist? && !lock_path.file?)
+        raise TransactionFailure, "unsafe overlay mutation lock: #{lock_path}"
+      end
+
+      flags = File::RDWR | File::CREAT | File::NOFOLLOW
+      lock = File.open(lock_path, flags, 0640)
+      unless lock.stat.uid == Process.uid
+        lock.close
+        raise TransactionFailure, "overlay mutation lock is not owned by uid #{Process.uid}: #{lock_path}"
+      end
+      lock.chmod 0640
+      lock.close_on_exec = true
+      lock.flock(File::LOCK_EX)
+      owner = "#{Process.pid}-#{Thread.current.object_id}-#{SecureRandom.hex(16)}"
+      lock.rewind
+      lock.truncate(0)
+      lock.write("#{owner}\n")
+      lock.flush
+      lock.fsync
+      @mutation_lock = lock
+      @mutation_owner = owner
+
+      script = HOMEBREW_LIBRARY_PATH/"utils/overlay.sh"
+      Homebrew.safe_system mutation_environment, "/bin/bash", script,
+                           "--mark-generation-dirty", HOMEBREW_PREFIX.to_s
+    rescue Exception # rubocop:disable Lint/RescueException
+      release_mutation_lock!
+      raise
+    end
+
+    # Advance the native prefix's explicit package generation after a
+    # completed mutation. Native helpers reuse an already-active outer scope;
+    # the owner writes the generation, removes the dirty marker, and releases
+    # the global mutation lock.
     sig { void }
     def self.bump_generation!
       return unless Homebrew::EnvConfig.overlay?
 
+      begin_mutation! unless mutation_active?
+
       script = HOMEBREW_LIBRARY_PATH/"utils/overlay.sh"
-      Homebrew.safe_system "/bin/bash", script, "--bump-generation", HOMEBREW_PREFIX.to_s
+      Homebrew.safe_system mutation_environment, "/bin/bash", script,
+                           "--bump-generation", HOMEBREW_PREFIX.to_s
+      release_mutation_lock!
+    rescue Exception # rubocop:disable Lint/RescueException
+      release_mutation_lock!
+      raise
     end
 
     sig { params(mutation: T::Boolean, owner_transaction_id: T.nilable(String)).void }
     def self.sync!(mutation: false, owner_transaction_id: nil)
       return unless active?
 
-      bump_generation! if mutation
+      begin_mutation! if mutation && !mutation_active?
+
       script = HOMEBREW_LIBRARY_PATH/"utils/overlay.sh"
-      environment = T.let({}, T::Hash[String, T.nilable(String)])
+      environment = mutation_environment(finalize: mutation)
       if owner_transaction_id
         environment["HOMEBREW_OVERLAY_OWNER_TRANSACTION_ID"] = owner_transaction_id
       end
       Homebrew.safe_system environment, "/bin/bash", script, "--sync"
+      release_mutation_lock! if mutation
       @link_state_entries = nil
+    rescue Exception # rubocop:disable Lint/RescueException
+      release_mutation_lock! if mutation
+      raise
     end
+
+    sig { params(finalize: T::Boolean).returns(T::Hash[String, T.nilable(String)]) }
+    def self.mutation_environment(finalize: false)
+      environment = T.let({}, T::Hash[String, T.nilable(String)])
+      owner = @mutation_owner
+      environment["HOMEBREW_OVERLAY_MUTATION_OWNER"] = owner if owner
+      environment["HOMEBREW_OVERLAY_FINALIZE_MUTATION"] = "1" if finalize
+      environment
+    end
+    private_class_method :mutation_environment
+
+    sig { void }
+    def self.release_mutation_lock!
+      lock = @mutation_lock
+      if lock
+        lock.flock(File::LOCK_UN) unless lock.closed?
+        lock.close unless lock.closed?
+      end
+      @mutation_lock = nil
+      @mutation_owner = nil
+    end
+    private_class_method :release_mutation_lock!
 
     sig { void }
     def self.clear_caches!

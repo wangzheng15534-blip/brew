@@ -603,6 +603,9 @@ class FormulaInstaller
         Homebrew::Overlay.validate_local_install_target!(formula.name, formula.pkg_version.to_s)
       end
     end
+    if Homebrew::EnvConfig.overlay? && !Homebrew::Overlay.mutation_active?
+      Homebrew::Overlay.begin_mutation!
+    end
     if @overlay_transaction
       @overlay_previous_failed = Homebrew.failed?
       Homebrew.failed = false

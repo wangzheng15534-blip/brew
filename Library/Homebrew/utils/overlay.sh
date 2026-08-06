@@ -67,6 +67,81 @@ homebrew-overlay-generation-file() {
   printf '%s\n' "${prefix}/var/homebrew/overlay-generation"
 }
 
+homebrew-overlay-generation-dirty-file() {
+  local prefix="$1"
+  printf '%s\n' "${prefix}/var/homebrew/overlay-generation.dirty"
+}
+
+homebrew-overlay-mutation-lock-file() {
+  local prefix="$1"
+  printf '%s\n' "${prefix}/var/homebrew/locks/overlay-mutation.lock"
+}
+
+homebrew-overlay-mutation-owner-valid() {
+  [[ "$1" =~ ^[A-Za-z0-9._-]{16,128}$ ]]
+}
+
+homebrew-overlay-prepare-mutation-lock() {
+  local prefix="$1"
+  local lock_file owner
+
+  prefix="$(homebrew-overlay-normalize-absolute "${prefix}")" || return 1
+  homebrew-overlay-prefix-owned-and-writable "${prefix}" || return 1
+  lock_file="$(homebrew-overlay-mutation-lock-file "${prefix}")" || return 1
+  homebrew-overlay-safe-mkdir "${prefix}" "${lock_file%/*}" || return 1
+  if [[ ! -e "${lock_file}" && ! -L "${lock_file}" ]]
+  then
+    (umask 027; set -o noclobber; : >"${lock_file}") 2>/dev/null || true
+  fi
+  [[ -f "${lock_file}" && ! -L "${lock_file}" ]] || {
+    echo "Error: unsafe Homebrew overlay mutation lock: ${lock_file}" >&2
+    return 1
+  }
+  owner="$(stat -c '%u' -- "${lock_file}")" || return 1
+  [[ "${owner}" == "$(id -u)" ]] || {
+    echo "Error: Homebrew overlay mutation lock is not owned by uid $(id -u): ${lock_file}" >&2
+    return 1
+  }
+  chmod 0640 "${lock_file}" || return 1
+  printf '%s\n' "${lock_file}"
+}
+
+homebrew-overlay-mutation-active() {
+  local prefix="$1"
+  local lock_file lock_fd
+
+  lock_file="$(homebrew-overlay-mutation-lock-file "${prefix}")" || return 2
+  [[ -e "${lock_file}" || -L "${lock_file}" ]] || return 1
+  [[ -f "${lock_file}" && ! -L "${lock_file}" && -r "${lock_file}" ]] || return 2
+  exec {lock_fd}<"${lock_file}" || return 2
+  if flock -x -n "${lock_fd}"
+  then
+    flock -u "${lock_fd}" || true
+    exec {lock_fd}>&-
+    return 1
+  fi
+  exec {lock_fd}>&-
+  return 0
+}
+
+homebrew-overlay-read-generation-dirty() {
+  local prefix="$1"
+  local dirty_file generation
+  local -a lines=()
+
+  dirty_file="$(homebrew-overlay-generation-dirty-file "${prefix}")" || return 1
+  [[ -e "${dirty_file}" || -L "${dirty_file}" ]] || return 1
+  [[ -f "${dirty_file}" && ! -L "${dirty_file}" && -r "${dirty_file}" ]] || {
+    echo "Error: invalid Homebrew overlay dirty generation marker: ${dirty_file}" >&2
+    return 2
+  }
+  mapfile -t lines <"${dirty_file}" || return 2
+  ((${#lines[@]} == 1)) || return 2
+  generation="${lines[0]}"
+  homebrew-overlay-base-generation-valid "${generation}" || return 2
+  printf '%s\n' "${generation}"
+}
+
 homebrew-overlay-read-generation() {
   local prefix="$1"
   local generation_file generation
@@ -172,6 +247,37 @@ homebrew-overlay-ensure-generation() {
   homebrew-overlay-atomic-write "${generation_file}" 0640 <<<"${generation}" || return 1
 }
 
+homebrew-overlay-mark-generation-dirty() {
+  local prefix="$1"
+  local dirty_file generation
+
+  prefix="$(homebrew-overlay-normalize-absolute "${prefix}")" || return 1
+  homebrew-overlay-prefix-owned-and-writable "${prefix}" || return 1
+  homebrew-overlay-ensure-generation "${prefix}" || return 1
+  dirty_file="$(homebrew-overlay-generation-dirty-file "${prefix}")" || return 1
+  if [[ -e "${dirty_file}" || -L "${dirty_file}" ]]
+  then
+    homebrew-overlay-read-generation-dirty "${prefix}" >/dev/null || return 1
+    return 0
+  fi
+
+  homebrew-overlay-safe-mkdir "${prefix}" "${dirty_file%/*}" || return 1
+  generation="$(homebrew-overlay-read-generation "${prefix}")" || return 1
+  homebrew-overlay-atomic-write "${dirty_file}" 0640 <<<"${generation}" || return 1
+}
+
+homebrew-overlay-clear-generation-dirty() {
+  local prefix="$1"
+  local dirty_file
+
+  prefix="$(homebrew-overlay-normalize-absolute "${prefix}")" || return 1
+  homebrew-overlay-prefix-owned-and-writable "${prefix}" || return 1
+  dirty_file="$(homebrew-overlay-generation-dirty-file "${prefix}")" || return 1
+  [[ -e "${dirty_file}" || -L "${dirty_file}" ]] || return 0
+  homebrew-overlay-read-generation-dirty "${prefix}" >/dev/null || return 1
+  rm -f -- "${dirty_file}" || return 1
+}
+
 homebrew-overlay-bump-generation() {
   local prefix="$1"
   local generation_file previous generation
@@ -186,6 +292,29 @@ homebrew-overlay-bump-generation() {
   } | sha256sum | awk '{print $1}')" || return 1
   homebrew-overlay-base-generation-valid "${generation}" || return 1
   homebrew-overlay-atomic-write "${generation_file}" 0640 <<<"${generation}" || return 1
+  homebrew-overlay-clear-generation-dirty "${prefix}" || return 1
+  printf '%s\n' "${generation}"
+}
+
+homebrew-overlay-recover-generation() {
+  local prefix="$1"
+  local dirty_file generation_file generation
+
+  prefix="$(homebrew-overlay-normalize-absolute "${prefix}")" || return 1
+  homebrew-overlay-prefix-owned-and-writable "${prefix}" || return 1
+  homebrew-overlay-ensure-generation "${prefix}" || return 1
+  dirty_file="$(homebrew-overlay-generation-dirty-file "${prefix}")" || return 1
+  if [[ ! -e "${dirty_file}" && ! -L "${dirty_file}" ]]
+  then
+    homebrew-overlay-read-generation "${prefix}"
+    return
+  fi
+  homebrew-overlay-read-generation-dirty "${prefix}" >/dev/null || return 1
+  generation_file="$(homebrew-overlay-generation-file "${prefix}")" || return 1
+  generation="$(homebrew-overlay-structural-view-key "${prefix}")" || return 1
+  homebrew-overlay-base-generation-valid "${generation}" || return 1
+  homebrew-overlay-atomic-write "${generation_file}" 0640 <<<"${generation}" || return 1
+  homebrew-overlay-clear-generation-dirty "${prefix}" || return 1
   printf '%s\n' "${generation}"
 }
 
@@ -607,7 +736,15 @@ homebrew-overlay-structural-view-key() {
 
 homebrew-overlay-view-key() {
   local prefix="$1"
-  local generation_file
+  local generation_file dirty_file
+
+  dirty_file="$(homebrew-overlay-generation-dirty-file "${prefix}")" || return 1
+  if [[ -e "${dirty_file}" || -L "${dirty_file}" ]]
+  then
+    homebrew-overlay-read-generation-dirty "${prefix}" >/dev/null || return 1
+    homebrew-overlay-structural-view-key "${prefix}"
+    return
+  fi
 
   generation_file="$(homebrew-overlay-generation-file "${prefix}")" || return 1
   if [[ -e "${generation_file}" || -L "${generation_file}" ]]
@@ -860,6 +997,11 @@ homebrew-overlay-recover-formula-transactions() {
     replacement_marker_id="$(homebrew-overlay-transaction-marker-id "${replacement_marker}")" || return 1
     failed_marker_id="$(homebrew-overlay-transaction-marker-id "${failed_marker}")" || return 1
 
+    # Recovery may mutate the live Cellar before the journal is removed. Mark
+    # the explicit generation dirty first so a second crash cannot leave a
+    # stale fast-path generation with no remaining transaction evidence.
+    homebrew-overlay-mark-generation-dirty "${prefix}" || return 1
+
     case "${state}" in
       staging)
         # The active package view was never changed.
@@ -974,7 +1116,11 @@ homebrew-overlay-sync-unlocked() {
   local force="${1:-0}"
   local prefix configured_base base_prefix state_dir state_file stamp_file
   local base_key local_key old_base="" old_local=""
+  local local_dirty=0 finalize_mutation=0 mutation_status=0
+  local base_dirty_file local_dirty_file
   local desired transaction_dir transaction_state transaction_desired temporary_stamp
+
+  homebrew-overlay-truthy "${HOMEBREW_OVERLAY_FINALIZE_MUTATION:-}" && finalize_mutation=1
 
   prefix="$(homebrew-overlay-normalize-absolute "${HOMEBREW_PREFIX}")" || return 1
   configured_base="${HOMEBREW_OVERLAY_BASE_PREFIX:?HOMEBREW_OVERLAY_BASE_PREFIX is required}"
@@ -1004,7 +1150,6 @@ homebrew-overlay-sync-unlocked() {
 
   if [[ "${HOMEBREW_OVERLAY_FORMULA_RECOVERED:-0}" -eq 1 ]]
   then
-    homebrew-overlay-bump-generation "${prefix}" >/dev/null || return 1
     force=1
   fi
   if [[ "${HOMEBREW_OVERLAY_SYNC_RECOVERED:-0}" -eq 1 ]]
@@ -1013,6 +1158,30 @@ homebrew-overlay-sync-unlocked() {
   fi
 
   homebrew-overlay-ensure-generation "${prefix}" || return 1
+  base_dirty_file="$(homebrew-overlay-generation-dirty-file "${base_prefix}")" || return 1
+  local_dirty_file="$(homebrew-overlay-generation-dirty-file "${prefix}")" || return 1
+  if [[ -e "${base_dirty_file}" || -L "${base_dirty_file}" ]]
+  then
+    homebrew-overlay-read-generation-dirty "${base_prefix}" >/dev/null || return 1
+    if homebrew-overlay-mutation-active "${base_prefix}"
+    then
+      echo "Error: the administrator Homebrew prefix is being mutated; retry after it finishes" >&2
+      return 1
+    else
+      mutation_status=$?
+      [[ "${mutation_status}" -eq 1 ]] || {
+        echo "Error: could not validate the administrator Homebrew mutation lock" >&2
+        return 1
+      }
+    fi
+    force=1
+  fi
+  if [[ -e "${local_dirty_file}" || -L "${local_dirty_file}" ]]
+  then
+    homebrew-overlay-read-generation-dirty "${prefix}" >/dev/null || return 1
+    local_dirty=1
+    force=1
+  fi
 
   base_key="$(homebrew-overlay-view-key "${base_prefix}")" || return 1
   local_key="$(homebrew-overlay-view-key "${prefix}")" || return 1
@@ -1055,8 +1224,20 @@ homebrew-overlay-sync-unlocked() {
   homebrew-overlay-apply-view "${prefix}" "${transaction_desired}" "${state_file}" || return 1
   rm -f -- "${transaction_state}" "${transaction_desired}" || return 1
 
-  # Synchronization changes only inherited view links, not the local package
-  # generation. Store the explicit package generations that produced the view.
+  # A dirty local generation belongs either to this explicitly finalizing
+  # mutation or to a crashed process whose global mutation lock was acquired by
+  # this synchronizer. Rebuild first, then publish a structural generation and
+  # remove the dirty marker. A live owner never reaches this point without the
+  # matching owner token.
+  if [[ "${local_dirty}" -eq 1 &&
+        ( "${finalize_mutation}" -eq 1 || -z "${HOMEBREW_OVERLAY_MUTATION_OWNER:-}" ) ]]
+  then
+    local_key="$(homebrew-overlay-recover-generation "${prefix}")" || return 1
+  fi
+
+  # Store the package generations that produced the reconciled inherited view.
+  # A dirty administrator generation remains structural until an administrator
+  # invocation acquires its mutation lock and recovers the explicit marker.
   temporary_stamp="${stamp_file}.tmp.$$.$RANDOM"
   printf '%s\n%s\n' "${base_key}" "${local_key}" >"${temporary_stamp}" || return 1
   chmod 0600 "${temporary_stamp}" || {
@@ -1068,23 +1249,47 @@ homebrew-overlay-sync-unlocked() {
 
 homebrew-overlay-sync() {
   local force=0
-  local lock_file
+  local lock_file mutation_lock owner="${HOMEBREW_OVERLAY_MUTATION_OWNER:-}"
   [[ "${1:-}" == "--force" ]] && force=1
   lock_file="${HOMEBREW_PREFIX}/var/homebrew/locks/overlay-sync.lock"
   homebrew-overlay-safe-mkdir "${HOMEBREW_PREFIX}" "${lock_file%/*}" || return 1
+  mutation_lock="$(homebrew-overlay-prepare-mutation-lock "${HOMEBREW_PREFIX}")" || return 1
 
   command -v flock >/dev/null 2>&1 || {
     echo "Error: active Homebrew overlays require flock from util-linux" >&2
     return 1
   }
   (
+    local recorded_owner=""
     flock -x 9 || exit 1
+    if [[ -n "${owner}" ]]
+    then
+      homebrew-overlay-mutation-owner-valid "${owner}" || {
+        echo "Error: invalid Homebrew overlay mutation owner token" >&2
+        exit 1
+      }
+      IFS= read -r recorded_owner <"${mutation_lock}" || true
+      [[ "${recorded_owner}" == "${owner}" ]] || {
+        echo "Error: Homebrew overlay mutation owner does not match the active lock" >&2
+        exit 1
+      }
+    else
+      flock -x -n 8 || {
+        echo "Error: another Homebrew package mutation is still active; retry after it finishes" >&2
+        exit 1
+      }
+    fi
     homebrew-overlay-sync-unlocked "${force}"
-  ) 9>"${lock_file}"
+  ) 8<>"${mutation_lock}" 9>"${lock_file}"
 }
 
 homebrew-overlay-bootstrap() {
   homebrew-overlay-truthy "${HOMEBREW_OVERLAY:-}" || return 0
+
+  command -v flock >/dev/null 2>&1 || {
+    echo "Error: active Homebrew overlays require flock from util-linux" >&2
+    return 1
+  }
 
   if homebrew-overlay-truthy "${HOMEBREW_OVERLAY_ACTIVE:-}"
   then
@@ -1095,10 +1300,19 @@ homebrew-overlay-bootstrap() {
   if homebrew-overlay-prefix-writable "${HOMEBREW_PREFIX}" &&
      ! homebrew-overlay-truthy "${HOMEBREW_OVERLAY_FORCE:-}"
   then
-    # Administrator package mutations use this explicit generation to make
-    # developer read-only invocations O(1). Initializing it from the current
-    # native package view preserves the pre-marker generation exactly.
-    homebrew-overlay-ensure-generation "${HOMEBREW_PREFIX}" || return 1
+    # Recover a crash-dirty administrator generation only while holding the
+    # same global mutation lock used by package changes. A live mutation makes
+    # concurrent invocations fail instead of blessing a transient structure.
+    local mutation_lock
+    mutation_lock="$(homebrew-overlay-prepare-mutation-lock "${HOMEBREW_PREFIX}")" || return 1
+    (
+      flock -x -n 8 || {
+        echo "Error: another Homebrew package mutation is still active; retry after it finishes" >&2
+        exit 1
+      }
+      homebrew-overlay-ensure-generation "${HOMEBREW_PREFIX}" || exit 1
+      homebrew-overlay-recover-generation "${HOMEBREW_PREFIX}" >/dev/null || exit 1
+    ) 8<>"${mutation_lock}" || return 1
     return 0
   fi
 
@@ -1134,12 +1348,20 @@ then
       homebrew-overlay-ensure-generation "${prefix}"
       homebrew-overlay-read-generation "${prefix}"
       ;;
+    --mark-generation-dirty)
+      prefix="$(homebrew-overlay-normalize-absolute "${2:-${HOMEBREW_PREFIX:-}}")" || exit 1
+      homebrew-overlay-mark-generation-dirty "${prefix}"
+      ;;
+    --recover-generation)
+      prefix="$(homebrew-overlay-normalize-absolute "${2:-${HOMEBREW_PREFIX:-}}")" || exit 1
+      homebrew-overlay-recover-generation "${prefix}"
+      ;;
     --bump-generation)
       prefix="$(homebrew-overlay-normalize-absolute "${2:-${HOMEBREW_PREFIX:-}}")" || exit 1
       homebrew-overlay-bump-generation "${prefix}"
       ;;
     *)
-      echo "Usage: overlay.sh --sync|--quick-sync|--base-generation|--ensure-generation [prefix]|--bump-generation [prefix]" >&2
+      echo "Usage: overlay.sh --sync|--quick-sync|--base-generation|--ensure-generation [prefix]|--mark-generation-dirty [prefix]|--recover-generation [prefix]|--bump-generation [prefix]" >&2
       exit 2
       ;;
   esac

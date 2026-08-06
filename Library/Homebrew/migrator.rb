@@ -248,6 +248,8 @@ class Migrator
   def migrate
     oh1 "Migrating formula #{Formatter.identifier(oldname)} to #{Formatter.identifier(newname)}"
     lock
+    owns_overlay_mutation = Homebrew::EnvConfig.overlay? && !Homebrew::Overlay.mutation_active?
+    Homebrew::Overlay.begin_mutation! if owns_overlay_mutation
     unlink_oldname
     unlink_newname if new_cellar.exist?
     repin
@@ -278,6 +280,7 @@ class Migrator
     puts "Backing up..."
     ignore_interrupts { backup_oldname }
   ensure
+    Homebrew::Overlay.bump_generation! if owns_overlay_mutation && Homebrew::Overlay.mutation_active?
     unlock
   end
 

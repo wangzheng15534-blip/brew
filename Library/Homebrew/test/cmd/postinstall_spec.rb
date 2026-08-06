@@ -27,6 +27,8 @@ RSpec.describe Homebrew::Cmd::Postinstall do
     allow(cmd.args.named).to receive(:to_resolved_formulae).and_return([formula])
     allow(Homebrew::Overlay).to receive(:inherited_keg?).with(formula.prefix).and_return(false)
     expect(formula).not_to receive(:run_post_install_steps)
+    expect(Homebrew::Overlay).to receive(:begin_mutation!).ordered
+    expect(formula).to receive(:install_etc_var).ordered
     expect(FormulaInstaller).to receive(:new)
       .with(formula, debug: false, quiet: false, verbose: false)
       .ordered

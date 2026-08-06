@@ -31,6 +31,10 @@ RSpec.describe Homebrew::Overlay do
     Keg.clear_cache
   end
 
+  after do
+    described_class.send(:release_mutation_lock!) if described_class.mutation_active?
+  end
+
   def add_base_formula(name, version)
     keg = base_cellar/name/version
     (keg/"bin").mkpath
@@ -219,11 +223,24 @@ RSpec.describe Homebrew::Overlay do
     expect(link).not_to be_a_symlink
   end
 
-  it "advances the native prefix generation through the overlay helper" do
+  it "marks the prefix dirty before advancing its generation" do
     script = HOMEBREW_LIBRARY_PATH/"utils/overlay.sh"
+    owner_matcher = a_string_matching(/\A[0-9]+-[0-9]+-[0-9a-f]{32}\z/)
+    expected_environment = hash_including("HOMEBREW_OVERLAY_MUTATION_OWNER" => owner_matcher)
+
     expect(Homebrew).to receive(:safe_system)
-      .with("/bin/bash", script, "--bump-generation", prefix.to_s)
+      .with(expected_environment, "/bin/bash", script, "--mark-generation-dirty", prefix.to_s)
+      .ordered
+    expect(Homebrew).to receive(:safe_system)
+      .with(expected_environment, "/bin/bash", script, "--bump-generation", prefix.to_s)
+      .ordered
+
+    described_class.begin_mutation!
+    expect(described_class.mutation_active?).to be(true)
+    lock_path = prefix/"var/homebrew/locks/overlay-mutation.lock"
+    expect(system("flock", "-xn", lock_path.to_s, "-c", "true", out: File::NULL, err: File::NULL)).to be(false)
 
     described_class.bump_generation!
+    expect(described_class.mutation_active?).to be(false)
   end
 end

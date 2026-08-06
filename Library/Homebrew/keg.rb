@@ -335,6 +335,9 @@ class Keg
       raise Homebrew::Overlay::InheritedKegError.new(path, Homebrew::Overlay.base_prefix)
     end
 
+    owns_overlay_mutation = Homebrew::EnvConfig.overlay? && !Homebrew::Overlay.mutation_active?
+    Homebrew::Overlay.begin_mutation! if owns_overlay_mutation
+
     CacheStoreDatabase.use(:linkage) do |db|
       break unless db.created?
 
@@ -349,11 +352,12 @@ class Keg
     remove_linked_keg_record if linked?
     remove_old_aliases
     remove_oldname_opt_records
-    if Homebrew::Overlay.active?
-      restored_inherited_rack = Homebrew::Overlay.restore_inherited_rack!(name)
-      Homebrew::Overlay.sync!(mutation: true) unless restored_inherited_rack
-    else
-      Homebrew::Overlay.bump_generation!
+    if owns_overlay_mutation
+      if Homebrew::Overlay.active?
+        Homebrew::Overlay.sync!(mutation: true)
+      else
+        Homebrew::Overlay.bump_generation!
+      end
     end
   rescue Errno::EACCES, Errno::ENOTEMPTY
     raise if raise_failures
@@ -373,6 +377,8 @@ class Keg
 
   sig { params(verbose: T::Boolean, dry_run: T::Boolean).returns(Integer) }
   def unlink(verbose: false, dry_run: false)
+    owns_overlay_mutation = !dry_run && Homebrew::EnvConfig.overlay? && !Homebrew::Overlay.mutation_active?
+    Homebrew::Overlay.begin_mutation! if owns_overlay_mutation
     ObserverPathnameExtension.reset_counts!
 
     dirs = []
@@ -409,7 +415,7 @@ class Keg
     end
 
     count = ObserverPathnameExtension.n
-    Homebrew::Overlay.bump_generation! unless dry_run
+    Homebrew::Overlay.bump_generation! if owns_overlay_mutation
     count
   end
 
@@ -512,9 +518,11 @@ class Keg
   def link(verbose: false, dry_run: false, overwrite: false)
     raise AlreadyLinkedError, self if linked_keg_record.directory?
 
+    owns_overlay_mutation = !dry_run && Homebrew::EnvConfig.overlay? && !Homebrew::Overlay.mutation_active?
+    Homebrew::Overlay.begin_mutation! if owns_overlay_mutation
     ObserverPathnameExtension.reset_counts!
 
-    optlink(verbose:, dry_run:, overwrite:) unless dry_run
+    optlink(verbose:, dry_run:, overwrite:, record_mutation: false) unless dry_run
 
     # yeah indeed, you have to force anything you need in the main tree into
     # these dirs REMEMBER that *NOT* everything needs to be in the main tree
@@ -595,10 +603,11 @@ class Keg
     make_relative_symlink(linked_keg_record, path, verbose:, dry_run:, overwrite:) unless dry_run
   rescue LinkError
     unlink(verbose:)
+    Homebrew::Overlay.bump_generation! if owns_overlay_mutation
     raise
   else
     count = ObserverPathnameExtension.n
-    Homebrew::Overlay.bump_generation! unless dry_run
+    Homebrew::Overlay.bump_generation! if owns_overlay_mutation
     count
   end
 
@@ -635,8 +644,18 @@ class Keg
     tab.aliases || []
   end
 
-  sig { params(verbose: T::Boolean, dry_run: T::Boolean, overwrite: T::Boolean).void }
-  def optlink(verbose: false, dry_run: false, overwrite: false)
+  sig do
+    params(
+      verbose:         T::Boolean,
+      dry_run:         T::Boolean,
+      overwrite:       T::Boolean,
+      record_mutation: T::Boolean,
+    ).void
+  end
+  def optlink(verbose: false, dry_run: false, overwrite: false, record_mutation: true)
+    owns_overlay_mutation = record_mutation && !dry_run && Homebrew::EnvConfig.overlay? &&
+      !Homebrew::Overlay.mutation_active?
+    Homebrew::Overlay.begin_mutation! if owns_overlay_mutation
     opt_record.delete if opt_record.symlink? || opt_record.exist?
     make_relative_symlink(opt_record, path, verbose:, dry_run:, overwrite:)
     aliases.each do |a|
@@ -649,6 +668,7 @@ class Keg
       record.delete
       make_relative_symlink(record, path, verbose:, dry_run:, overwrite:)
     end
+    Homebrew::Overlay.bump_generation! if owns_overlay_mutation
   end
 
   sig { void }
