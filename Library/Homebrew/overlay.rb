@@ -139,7 +139,7 @@ module Homebrew
         Overlay.ensure_inherited_rack!(formula_name)
         acquire_owner_lock!
         Overlay.begin_mutation! unless Overlay.mutation_active?
-        staging_rack.mkpath
+        Overlay.ensure_owned_directory!(staging_rack)
         staging_rack.chmod 0700
         write_metadata("formula", formula_name)
         write_metadata("version", version)
@@ -237,10 +237,7 @@ module Homebrew
           transaction_dir.exist? || transaction_dir.symlink?
 
         lock_dir = @owner_lock_path.parent
-        lock_dir.mkpath
-        unless lock_dir.directory? && !lock_dir.symlink? && lock_dir.stat.uid == Process.uid
-          raise TransactionFailure, "unsafe overlay transaction lock directory: #{lock_dir}"
-        end
+        Overlay.ensure_owned_directory!(lock_dir)
         lock_dir.chmod 0700
         if @owner_lock_path.symlink? || @owner_lock_path.exist?
           raise TransactionFailure, "overlay transaction owner lock already exists: #{@owner_lock_path}"
@@ -254,10 +251,7 @@ module Homebrew
           raise TransactionFailure, "could not acquire overlay transaction owner lock: #{@owner_lock_path}"
         end
 
-        transaction_dir.mkpath
-        unless transaction_dir.directory? && !transaction_dir.symlink? && transaction_dir.stat.uid == Process.uid
-          raise TransactionFailure, "unsafe overlay transaction directory: #{transaction_dir}"
-        end
+        Overlay.ensure_owned_directory!(transaction_dir)
         transaction_dir.chmod 0700
       end
 
@@ -287,7 +281,7 @@ module Homebrew
       def prepare_replacement_rack!
         raise TransactionFailure, "overlay replacement rack already exists: #{replacement_rack}" if replacement_rack.exist?
 
-        replacement_rack.mkpath
+        Overlay.ensure_owned_directory!(replacement_rack)
         replacement_rack.chmod 0700
         base_rack = Overlay.base_cellar/formula_name
         base_rack.children.each do |base_version|
@@ -424,6 +418,40 @@ module Homebrew
       path = path.expand_path
       root = root.expand_path
       path == root || path.to_s.start_with?("#{root}/")
+    end
+
+    # Create a private internal directory without following any symlinked
+    # component below the native prefix. Existing ancestors must remain real,
+    # writable directories owned by the current user.
+    sig { params(directory: Pathname).void }
+    def self.ensure_owned_directory!(directory)
+      prefix = HOMEBREW_PREFIX.expand_path
+      directory = directory.expand_path
+      unless prefix.directory? && !prefix.symlink? && prefix.stat.uid == Process.uid && prefix.writable?
+        raise TransactionFailure, "unsafe or non-writable Homebrew overlay prefix: #{prefix}"
+      end
+      unless path_under?(directory, prefix)
+        raise TransactionFailure, "overlay directory escapes the native prefix: #{directory}"
+      end
+
+      relative = directory.relative_path_from(prefix)
+      current = prefix
+      relative.each_filename do |component|
+        if component.empty? || component == "." || component == ".."
+          raise TransactionFailure, "invalid overlay directory component: #{directory}"
+        end
+
+        current /= component
+        if current.symlink? || (current.exist? && !current.directory?)
+          raise TransactionFailure, "unsafe overlay directory component: #{current}"
+        end
+        current.mkdir unless current.directory?
+        unless current.directory? && !current.symlink? && current.stat.uid == Process.uid && current.writable?
+          raise TransactionFailure, "unowned or non-writable overlay directory: #{current}"
+        end
+      end
+    rescue ArgumentError
+      raise TransactionFailure, "overlay directory escapes the native prefix: #{directory}"
     end
 
     sig { params(path: T.any(Pathname, String)).returns(T::Boolean) }
@@ -817,10 +845,7 @@ module Homebrew
 
       lock_path = HOMEBREW_PREFIX/"var/homebrew/locks/overlay-mutation.lock"
       lock_dir = lock_path.parent
-      lock_dir.mkpath
-      unless lock_dir.directory? && !lock_dir.symlink? && lock_dir.stat.uid == Process.uid
-        raise TransactionFailure, "unsafe overlay mutation lock directory: #{lock_dir}"
-      end
+      ensure_owned_directory!(lock_dir)
       if lock_path.symlink? || (lock_path.exist? && !lock_path.file?)
         raise TransactionFailure, "unsafe overlay mutation lock: #{lock_path}"
       end

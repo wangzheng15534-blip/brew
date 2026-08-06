@@ -64,6 +64,18 @@ mutation_lock="$(homebrew-overlay-prepare-mutation-lock "${case_user}/user")"
 ) 8<>"${mutation_lock}"
 test -f "$(homebrew-overlay-generation-dirty-file "${case_user}/user")"
 test "$(homebrew-overlay-read-generation "${case_user}/user")" = "${old_generation}"
+# Matching stale content is insufficient: only the process that still holds the
+# advisory lock may use an owner token to finalize a mutation.
+export HOMEBREW_OVERLAY_MUTATION_OWNER='crashed-user-owner-token-0001'
+export HOMEBREW_OVERLAY_FINALIZE_MUTATION=1
+if homebrew-overlay-sync >"${case_user}/stale-owner.out" 2>"${case_user}/stale-owner.err"
+then
+  echo 'stale mutation owner token unexpectedly synchronized' >&2
+  exit 1
+fi
+grep -q 'not backed by an active lock' "${case_user}/stale-owner.err"
+unset HOMEBREW_OVERLAY_MUTATION_OWNER HOMEBREW_OVERLAY_FINALIZE_MUTATION
+test -f "$(homebrew-overlay-generation-dirty-file "${case_user}/user")"
 homebrew-overlay-sync
 test ! -e "$(homebrew-overlay-generation-dirty-file "${case_user}/user")"
 recovered_generation="$(homebrew-overlay-read-generation "${case_user}/user")"

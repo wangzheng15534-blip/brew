@@ -223,6 +223,18 @@ RSpec.describe Homebrew::Overlay do
     expect(link).not_to be_a_symlink
   end
 
+  it "rejects symlinked intermediate mutation-state directories" do
+    FileUtils.rm_rf(prefix/"var")
+    outside = root/"outside"
+    outside.mkpath
+    FileUtils.ln_s(outside, prefix/"var")
+
+    expect do
+      described_class.begin_mutation!
+    end.to raise_error(Homebrew::Overlay::TransactionFailure, /unsafe overlay directory component/)
+    expect(outside/"homebrew/locks/overlay-mutation.lock").not_to exist
+  end
+
   it "marks the prefix dirty before advancing its generation" do
     script = HOMEBREW_LIBRARY_PATH/"utils/overlay.sh"
     owner_matcher = a_string_matching(/\A[0-9]+-[0-9]+-[0-9a-f]{32}\z/)

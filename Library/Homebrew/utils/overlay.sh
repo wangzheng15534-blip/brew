@@ -1268,6 +1268,12 @@ homebrew-overlay-sync() {
         echo "Error: invalid Homebrew overlay mutation owner token" >&2
         exit 1
       }
+      if flock -x -n 8
+      then
+        flock -u 8 || true
+        echo "Error: Homebrew overlay mutation owner is not backed by an active lock" >&2
+        exit 1
+      fi
       IFS= read -r recorded_owner <"${mutation_lock}" || true
       [[ "${recorded_owner}" == "${owner}" ]] || {
         echo "Error: Homebrew overlay mutation owner does not match the active lock" >&2
