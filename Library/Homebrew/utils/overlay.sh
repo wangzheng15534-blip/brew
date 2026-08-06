@@ -370,7 +370,7 @@ homebrew-overlay-build-view() {
   local output_file="$3"
   local base_cellar="${base_prefix}/Cellar"
   local user_cellar="${prefix}/Cellar"
-  local base_rack user_rack name base_version version_name
+  local base_rack user_rack user_version name base_version version_name
   local base_opt base_linked
 
   [[ -d "${base_cellar}" && ! -L "${base_cellar}" ]] || return 1
@@ -402,9 +402,26 @@ homebrew-overlay-build-view() {
       do
         [[ -d "${base_version}" && ! -L "${base_version}" ]] || continue
         version_name="${base_version##*/}"
-        [[ -e "${user_rack}/${version_name}" || -L "${user_rack}/${version_name}" ]] ||
+        user_version="${user_rack}/${version_name}"
+        if [[ ! -e "${user_version}" && ! -L "${user_version}" ]]
+        then
           homebrew-overlay-record-pair \
             "${output_file}" "Cellar/${name}/${version_name}" "${base_version}" || return 1
+        elif [[ -L "${user_version}" ]]
+        then
+          # Keep the exact lower version in desired state on every pass. The
+          # transition validator rejects any symlink with a different target.
+          homebrew-overlay-record-pair \
+            "${output_file}" "Cellar/${name}/${version_name}" "${base_version}" || return 1
+        elif [[ -d "${user_version}" ]]
+        then
+          # A real local keg with the same version intentionally shadows the
+          # administrator realization and is never managed by synchronization.
+          :
+        else
+          echo "Error: invalid version entry in user overlay rack: ${user_version}" >&2
+          return 1
+        fi
       done
     else
       echo "Error: invalid formula rack in user overlay: ${user_rack}" >&2
