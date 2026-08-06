@@ -135,6 +135,26 @@ RSpec.describe Utils::Autoremove do
       expect(described_class.unused_formulae_with_no_formula_dependents(formulae))
         .to eq([])
     end
+
+    it "uses an explicitly selected local keg instead of an inherited fallback" do
+      local_tab = instance_double(
+        Tab,
+        installed_on_request:          false,
+        installed_on_request_present?: true,
+        poured_from_bottle:             true,
+        runtime_dependencies:           nil,
+      )
+      local_keg = instance_double(Keg, tab: local_tab)
+      expect(first_formula_dep).not_to receive(:any_installed_keg)
+
+      expect(
+        described_class.removable_formulae(
+          [first_formula_dep],
+          [],
+          kegs_by_full_name: { first_formula_dep.full_name => local_keg },
+        ),
+      ).to eq([first_formula_dep])
+    end
   end
 
   shared_context "with formulae and casks for dependency testing" do

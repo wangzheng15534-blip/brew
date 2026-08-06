@@ -155,6 +155,50 @@ RSpec.describe Homebrew::Cleanup do
 
       expect { described_class.autoremove }.not_to output.to_stdout
     end
+
+    context "with a local keg shadowing an inherited keg" do
+      let(:rack) { HOMEBREW_CELLAR/"libthai" }
+      let(:local_keg) do
+        instance_double(
+          Keg,
+          name:               "libthai",
+          rack:,
+          scheme_and_version: [0, PkgVersion.parse("2")],
+          to_path:            rack/"2",
+        )
+      end
+      let(:inherited_keg) do
+        instance_double(
+          Keg,
+          name:               "libthai",
+          rack:,
+          scheme_and_version: [0, PkgVersion.parse("1")],
+          to_path:            rack/"1",
+        )
+      end
+
+      before do
+        allow(removable_formula).to receive(:installed_kegs).and_return([inherited_keg, local_keg])
+        allow(Homebrew::Overlay).to receive(:active?).and_return(true)
+        allow(Homebrew::Overlay).to receive(:inherited_keg?) do |path|
+          Pathname(path) == inherited_keg.to_path
+        end
+        allow(Utils::Autoremove).to receive(:removable_formulae).and_return([removable_formula])
+        allow(InstalledDependents).to receive(:find_some_installed_dependents)
+          .with([local_keg])
+          .and_return(nil)
+      end
+
+      it "autoremoves only private kegs" do
+        expect(Utils::Autoremove).to receive(:removable_formulae)
+          .with([removable_formula], [], kegs_by_full_name: { "libthai" => local_keg })
+          .and_return([removable_formula])
+        expect(Homebrew::Uninstall).to receive(:uninstall_kegs)
+          .with({ rack => [local_keg] }, force: true)
+
+        expect { described_class.autoremove }.to output(/Autoremoving 1 unneeded formula/).to_stdout
+      end
+    end
   end
 
   describe "::prune_prefix_symlinks_and_directories" do

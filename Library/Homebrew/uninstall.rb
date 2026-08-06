@@ -21,7 +21,19 @@ module Homebrew
       ).void
     }
     def self.uninstall_kegs(kegs_by_rack, casks: [], force: false, ignore_dependencies: false, named_args: [])
-      if (inherited_keg = kegs_by_rack.values.flatten.find do |keg|
+      inherited_only_kegs = T.let([], T::Array[Keg])
+      if force && Homebrew::Overlay.active?
+        local_kegs_by_rack = T.let({}, T::Hash[Pathname, T::Array[Keg]])
+        kegs_by_rack.each do |rack, kegs|
+          local_kegs = kegs.reject { |keg| Homebrew::Overlay.inherited_keg?(keg.to_path) }
+          if local_kegs.empty?
+            inherited_only_kegs << kegs.fetch(0) if kegs.any?
+          else
+            local_kegs_by_rack[rack] = local_kegs
+          end
+        end
+        kegs_by_rack = local_kegs_by_rack
+      elsif (inherited_keg = kegs_by_rack.values.flatten.find do |keg|
         Homebrew::Overlay.inherited_keg?(keg.to_path)
       end)
         inherited_keg_path = Pathname(inherited_keg.to_path)
@@ -119,6 +131,10 @@ module Homebrew
             end
           end
         end
+      end
+
+      inherited_only_kegs.each do |keg|
+        ofail Homebrew::Overlay::InheritedKegError.new(Pathname(keg.to_path), Homebrew::Overlay.base_prefix)
       end
     rescue MultipleVersionsInstalledError, Homebrew::Overlay::InheritedKegError => e
       ofail e
