@@ -27,6 +27,7 @@ RSpec.describe Homebrew::Overlay do
     )
     allow(described_class).to receive(:sync!)
     allow(described_class).to receive(:verify_base_generation!)
+    described_class.clear_caches!
     Formula.clear_cache
     Keg.clear_cache
   end
@@ -232,6 +233,28 @@ RSpec.describe Homebrew::Overlay do
 
     expect(described_class.remove_inherited_prefix_link!(link)).to be(true)
     expect(link).not_to be_a_symlink
+  end
+
+  it "rejects malformed or non-base managed link state" do
+    link = prefix/"opt/foo"
+    link.dirname.mkpath
+    FileUtils.ln_s(base_prefix/"opt/foo", link)
+    state_file = prefix/"var/homebrew/overlay/view.state"
+    state_file.dirname.mkpath
+    state_file.binwrite("opt/foo\0#{root}/outside/foo\0")
+
+    expect do
+      described_class.remove_inherited_prefix_link!(link)
+    end.to raise_error(Homebrew::Overlay::TransactionFailure, /invalid overlay view state/)
+    expect(link).to be_a_symlink
+
+    described_class.clear_caches!
+    target = (base_prefix/"opt/foo").to_s
+    state_file.binwrite("opt/foo\0#{target}\0opt/foo\0#{target}\0")
+    expect do
+      described_class.remove_inherited_prefix_link!(link)
+    end.to raise_error(Homebrew::Overlay::TransactionFailure, /invalid overlay view state/)
+    expect(link).to be_a_symlink
   end
 
   it "rejects symlinked intermediate mutation-state directories" do

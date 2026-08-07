@@ -847,17 +847,59 @@ module Homebrew
       HOMEBREW_PREFIX/"var/homebrew/overlay/view.state"
     end
 
+    sig { params(relative: String).returns(T.nilable(String)) }
+    def self.expected_link_target(relative)
+      components = relative.split("/", -1)
+      case components
+      in ["Cellar", formula]
+        return unless valid_formula_name?(formula)
+      in ["Cellar", formula, version]
+        return unless valid_formula_name?(formula) && valid_version_name?(version)
+      in ["opt", formula]
+        return unless valid_formula_name?(formula)
+      in ["var", "homebrew", "linked", formula]
+        return unless valid_formula_name?(formula)
+      else
+        return
+      end
+
+      (base_prefix/relative).to_s
+    end
+    private_class_method :expected_link_target
+
     sig { returns(T::Hash[String, String]) }
     def self.link_state_entries
       @link_state_entries ||= T.let(
-        if link_state_file.readable? && !link_state_file.symlink?
-          fields = link_state_file.binread.split("\0", -1)
-          fields.pop while fields.last == ""
-          fields.each_slice(2).filter_map do |relative, target|
-            next if relative.nil? || target.nil? || relative.empty? || target.empty?
+        if link_state_file.exist? || link_state_file.symlink?
+          state = link_state_file
+          unless state.file? && !state.symlink? && state.readable? && state.stat.uid == Process.uid && state.stat.nlink == 1
+            raise TransactionFailure, "unsafe overlay view state: #{state}"
+          end
 
-            [relative, target]
-          end.to_h
+          contents = state.binread
+          if contents.empty?
+            {}
+          else
+            unless contents.end_with?("\0")
+              raise TransactionFailure, "invalid overlay view state: #{state}"
+            end
+
+            fields = contents.split("\0", -1)
+            fields.pop
+            unless fields.length.even? && fields.none?(&:empty?)
+              raise TransactionFailure, "invalid overlay view state: #{state}"
+            end
+
+            entries = T.let({}, T::Hash[String, String])
+            fields.each_slice(2) do |relative, target|
+              expected = expected_link_target(relative)
+              if expected.nil? || target != expected || entries.key?(relative)
+                raise TransactionFailure, "invalid overlay view state: #{state}"
+              end
+              entries[relative] = target
+            end
+            entries
+          end
         else
           {}
         end,

@@ -30,7 +30,19 @@ homebrew-overlay-expand-home() {
 homebrew-overlay-normalize-absolute() {
   local path="$1"
   [[ "${path}" == /* ]] || return 1
-  readlink -m -- "${path}"
+  [[ "${path}" != *$'\n'* && "${path}" != *$'\r'* ]] || return 1
+  case "${path}" in
+    *//* | */./* | */. | */../* | */..)
+      readlink -m -- "${path}"
+      ;;
+    *)
+      while [[ "${path}" != / && "${path}" == */ ]]
+      do
+        path="${path%/}"
+      done
+      printf '%s\n' "${path}"
+      ;;
+  esac
 }
 
 homebrew-overlay-path-under() {
@@ -84,13 +96,14 @@ homebrew-overlay-mutation-owner-valid() {
 homebrew-overlay-lock-path-valid() {
   local lock_file="$1"
   local expected_owner="$2"
-  local owner links file_type
+  local owner links mode device inode
 
   [[ -f "${lock_file}" && ! -L "${lock_file}" && -r "${lock_file}" ]] || return 1
-  owner="$(stat -Lc '%u' -- "${lock_file}")" || return 1
-  links="$(stat -Lc '%h' -- "${lock_file}")" || return 1
-  file_type="$(stat -Lc '%F' -- "${lock_file}")" || return 1
-  [[ "${owner}" == "${expected_owner}" && "${links}" == 1 && "${file_type}" == regular*file ]]
+  read -r owner links mode device inode < <(
+    stat -Lc '%u %h %f %d %i' -- "${lock_file}"
+  ) || return 1
+  [[ "${owner}" == "${expected_owner}" && "${links}" == 1 ]] || return 1
+  (( (16#${mode} & 0170000) == 0100000 && (16#${mode} & 0022) == 0 ))
 }
 
 homebrew-overlay-lock-fd-valid() {
@@ -98,19 +111,23 @@ homebrew-overlay-lock-fd-valid() {
   local lock_file="$2"
   local expected_owner="$3"
   local fd_path="/proc/self/fd/${lock_fd}"
-  local fd_identity path_identity fd_owner fd_links fd_type
+  local -a metadata=()
+  local path_owner path_links path_mode path_device path_inode
+  local fd_owner fd_links fd_mode fd_device fd_inode
 
-  homebrew-overlay-lock-path-valid "${lock_file}" "${expected_owner}" || return 1
-  [[ -e "${fd_path}" ]] || return 1
-  fd_identity="$(stat -Lc '%d:%i' -- "${fd_path}")" || return 1
-  path_identity="$(stat -Lc '%d:%i' -- "${lock_file}")" || return 1
-  fd_owner="$(stat -Lc '%u' -- "${fd_path}")" || return 1
-  fd_links="$(stat -Lc '%h' -- "${fd_path}")" || return 1
-  fd_type="$(stat -Lc '%F' -- "${fd_path}")" || return 1
-  [[ "${fd_identity}" == "${path_identity}" &&
-     "${fd_owner}" == "${expected_owner}" && "${fd_links}" == 1 &&
-     "${fd_type}" == regular*file ]] || return 1
-  homebrew-overlay-lock-path-valid "${lock_file}" "${expected_owner}"
+  [[ -f "${lock_file}" && ! -L "${lock_file}" && -r "${lock_file}" &&
+     -e "${fd_path}" ]] || return 1
+  mapfile -t metadata < <(
+    stat -Lc '%u %h %f %d %i' -- "${lock_file}" "${fd_path}"
+  ) || return 1
+  ((${#metadata[@]} == 2)) || return 1
+  read -r path_owner path_links path_mode path_device path_inode <<<"${metadata[0]}" || return 1
+  read -r fd_owner fd_links fd_mode fd_device fd_inode <<<"${metadata[1]}" || return 1
+  [[ "${path_owner}" == "${expected_owner}" && "${path_links}" == 1 &&
+     "${path_owner}" == "${fd_owner}" && "${path_links}" == "${fd_links}" &&
+     "${path_mode}" == "${fd_mode}" && "${path_device}" == "${fd_device}" &&
+     "${path_inode}" == "${fd_inode}" ]] || return 1
+  (( (16#${path_mode} & 0170000) == 0100000 && (16#${path_mode} & 0022) == 0 ))
 }
 
 homebrew-overlay-prepare-mutation-lock() {
@@ -125,12 +142,11 @@ homebrew-overlay-prepare-mutation-lock() {
   then
     (umask 027; set -o noclobber; : >"${lock_file}") 2>/dev/null || true
   fi
-  owner="$(id -u)"
+  owner="${EUID}"
   homebrew-overlay-lock-path-valid "${lock_file}" "${owner}" || {
     echo "Error: unsafe Homebrew overlay mutation lock: ${lock_file}" >&2
     return 1
   }
-  chmod 0640 "${lock_file}" || return 1
   printf '%s\n' "${lock_file}"
 }
 
@@ -146,12 +162,11 @@ homebrew-overlay-prepare-sync-lock() {
   then
     (umask 027; set -o noclobber; : >"${lock_file}") 2>/dev/null || true
   fi
-  owner="$(id -u)"
+  owner="${EUID}"
   homebrew-overlay-lock-path-valid "${lock_file}" "${owner}" || {
     echo "Error: unsafe Homebrew overlay synchronization lock: ${lock_file}" >&2
     return 1
   }
-  chmod 0640 "${lock_file}" || return 1
   printf '%s\n' "${lock_file}"
 }
 
@@ -159,10 +174,18 @@ homebrew-overlay-existing-base-mutation-lock() {
   local base_prefix="$1"
   local lock_file base_owner
 
-  base_prefix="$(homebrew-overlay-normalize-absolute "${base_prefix}")" || return 1
+  [[ "${base_prefix}" == /* && "${base_prefix}" != *$'\n'* && "${base_prefix}" != *$'\r'* ]] || return 1
   [[ -d "${base_prefix}" && ! -L "${base_prefix}" ]] || return 1
   base_owner="$(stat -Lc '%u' -- "${base_prefix}")" || return 1
   lock_file="$(homebrew-overlay-mutation-lock-file "${base_prefix}")" || return 1
+  if [[ ! -e "${lock_file}" && ! -L "${lock_file}" &&
+        -O "${base_prefix}" && -w "${base_prefix}" ]]
+  then
+    # Same-owner development and test prefixes can provision their own lock.
+    # A separately owned administrator prefix still requires its owner to run
+    # this Homebrew build before developers consume it.
+    homebrew-overlay-prepare-mutation-lock "${base_prefix}" >/dev/null || return 1
+  fi
   homebrew-overlay-lock-path-valid "${lock_file}" "${base_owner}" || {
     echo "Error: the administrator Homebrew mutation lock is unavailable or unsafe: ${lock_file}" >&2
     echo "Ask an administrator to run this Homebrew build once before using the overlay." >&2
@@ -228,10 +251,7 @@ homebrew-overlay-read-generation() {
 
 homebrew-overlay-prefix-owned-and-writable() {
   local prefix="$1"
-  local owner
-  [[ -d "${prefix}" && ! -L "${prefix}" && -w "${prefix}" ]] || return 1
-  owner="$(stat -c '%u' -- "${prefix}")" || return 1
-  [[ "${owner}" == "$(id -u)" ]]
+  [[ -d "${prefix}" && ! -L "${prefix}" && -O "${prefix}" && -w "${prefix}" ]]
 }
 
 homebrew-overlay-prefix-writable() {
@@ -271,29 +291,62 @@ homebrew-overlay-safe-mkdir() {
     then
       mkdir -- "${current}" || return 1
     fi
-    owner="$(stat -c '%u' -- "${current}")" || return 1
-    [[ "${owner}" == "$(id -u)" && -w "${current}" ]] || return 1
+    [[ -O "${current}" && -w "${current}" ]] || return 1
   done
+}
+
+homebrew-overlay-private-temporary() {
+  local destination="$1"
+  local parent="${destination%/*}"
+  local name="${destination##*/}"
+
+  [[ -d "${parent}" && ! -L "${parent}" && -O "${parent}" && -w "${parent}" ]] || return 1
+  mktemp --tmpdir="${parent}" ".${name}.tmp.XXXXXX"
+}
+
+homebrew-overlay-publish-temporary() {
+  local temporary="$1"
+  local destination="$2"
+  local mode="$3"
+  local parent="${destination%/*}"
+
+  [[ -f "${temporary}" && ! -L "${temporary}" && -O "${temporary}" ]] || return 1
+  [[ "$(stat -Lc '%h' -- "${temporary}")" == 1 ]] || return 1
+  [[ -d "${parent}" && ! -L "${parent}" && -O "${parent}" && -w "${parent}" ]] || return 1
+  if [[ -e "${destination}" || -L "${destination}" ]]
+  then
+    [[ -f "${destination}" && ! -L "${destination}" && -O "${destination}" ]] || return 1
+  fi
+
+  chmod "${mode}" "${temporary}" || return 1
+  sync -d -- "${temporary}" || return 1
+  mv -fT -- "${temporary}" "${destination}" || return 1
+  sync -d -- "${parent}" || return 1
 }
 
 homebrew-overlay-atomic-write() {
   local destination="$1"
   local mode="$2"
-  local temporary="${destination}.tmp.$$.$RANDOM"
+  local temporary
 
-  [[ ! -L "${destination}" ]] || return 1
+  temporary="$(homebrew-overlay-private-temporary "${destination}")" || return 1
   cat >"${temporary}" || {
     rm -f -- "${temporary}"
     return 1
   }
-  chmod "${mode}" "${temporary}" || {
+  homebrew-overlay-publish-temporary "${temporary}" "${destination}" "${mode}" || {
     rm -f -- "${temporary}"
     return 1
   }
-  mv -fT -- "${temporary}" "${destination}" || {
-    rm -f -- "${temporary}"
-    return 1
-  }
+}
+
+homebrew-overlay-remove-durable() {
+  local path="$1"
+  local parent="${path%/*}"
+
+  [[ -d "${parent}" && ! -L "${parent}" && -O "${parent}" && -w "${parent}" ]] || return 1
+  rm -f -- "${path}" || return 1
+  sync -d -- "${parent}" || return 1
 }
 
 homebrew-overlay-ensure-generation() {
@@ -532,21 +585,144 @@ homebrew-overlay-record-pair() {
   printf '%s\0%s\0' "${relative}" "${target}" >>"${file}"
 }
 
+homebrew-overlay-view-pair-valid() {
+  local base_prefix="$1"
+  local relative="$2"
+  local target="$3"
+  local remainder formula version
+
+  [[ "${base_prefix}" == /* &&
+     "${base_prefix}" != *$'\n'* &&
+     "${base_prefix}" != *$'\r'* ]] || return 1
+  homebrew-overlay-valid-relative-path "${relative}" || return 1
+  [[ "${target}" == "${base_prefix}/${relative}" ]] || return 1
+
+  case "${relative}" in
+    Cellar/*)
+      remainder="${relative#Cellar/}"
+      if [[ "${remainder}" == */* ]]
+      then
+        formula="${remainder%%/*}"
+        version="${remainder#*/}"
+        homebrew-overlay-formula-name-valid "${formula}" || return 1
+        homebrew-overlay-valid-relative-path "${version}" || return 1
+        [[ "${version}" != */* ]]
+      else
+        homebrew-overlay-formula-name-valid "${remainder}"
+      fi
+      ;;
+    opt/*)
+      formula="${relative#opt/}"
+      [[ "${formula}" != */* ]] && homebrew-overlay-formula-name-valid "${formula}"
+      ;;
+    var/homebrew/linked/*)
+      formula="${relative#var/homebrew/linked/}"
+      [[ "${formula}" != */* ]] && homebrew-overlay-formula-name-valid "${formula}"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+homebrew-overlay-desired-target-valid() {
+  local base_prefix="$1"
+  local relative="$2"
+  local target="$3"
+  local formula resolved
+
+  homebrew-overlay-view-pair-valid "${base_prefix}" "${relative}" "${target}" || return 1
+  case "${relative}" in
+    Cellar/*)
+      [[ -d "${target}" && ! -L "${target}" ]]
+      ;;
+    opt/*)
+      formula="${relative#opt/}"
+      [[ -L "${target}" && -e "${target}" ]] || return 1
+      resolved="$(readlink -f -- "${target}")" || return 1
+      homebrew-overlay-path-under "${resolved}" "${base_prefix}/Cellar/${formula}"
+      ;;
+    var/homebrew/linked/*)
+      formula="${relative#var/homebrew/linked/}"
+      [[ -L "${target}" && -e "${target}" ]] || return 1
+      resolved="$(readlink -f -- "${target}")" || return 1
+      homebrew-overlay-path-under "${resolved}" "${base_prefix}/Cellar/${formula}"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 homebrew-overlay-load-state() {
   local file="$1"
   local array_name="$2"
+  local base_prefix="$3"
   local relative target
   local -n output_map="${array_name}"
   output_map=()
-  [[ -e "${file}" ]] || return 0
-  [[ -f "${file}" && ! -L "${file}" ]] || return 1
-  while IFS= read -r -d '' relative
+  [[ -e "${file}" || -L "${file}" ]] || return 0
+  [[ -f "${file}" && ! -L "${file}" && -O "${file}" && -r "${file}" ]] || return 1
+  [[ "$(stat -Lc '%h' -- "${file}")" == 1 ]] || return 1
+  while :
   do
+    relative=""
+    if ! IFS= read -r -d '' relative
+    then
+      [[ -z "${relative}" ]] || return 1
+      break
+    fi
+    target=""
     IFS= read -r -d '' target || return 1
-    homebrew-overlay-valid-relative-path "${relative}" || return 1
-    [[ "${target}" == /* ]] || return 1
+    homebrew-overlay-view-pair-valid "${base_prefix}" "${relative}" "${target}" || return 1
+    [[ -z "${output_map[${relative}]+present}" ]] || return 1
     output_map["${relative}"]="${target}"
   done <"${file}"
+}
+
+homebrew-overlay-state-links-match() {
+  local prefix="$1"
+  local base_prefix="$2"
+  local state_file="$3"
+  local relative
+  local -A state=()
+  local -a paths=()
+  local -a targets=()
+
+  homebrew-overlay-load-state "${state_file}" state "${base_prefix}" || return 2
+  for relative in "${!state[@]}"
+  do
+    paths+=("${prefix}/${relative}")
+    targets+=("${state[${relative}]}")
+    [[ -L "${prefix}/${relative}" ]] || return 1
+  done
+  ((${#paths[@]} == 0)) && return 0
+  cmp -s \
+    <(readlink -z -- "${paths[@]}") \
+    <(printf '%s\0' "${targets[@]}")
+}
+
+homebrew-overlay-state-digest() {
+  local state_file="$1"
+
+  [[ -f "${state_file}" && ! -L "${state_file}" && -O "${state_file}" && -r "${state_file}" ]] || return 2
+  [[ "$(stat -Lc '%h' -- "${state_file}")" == 1 ]] || return 2
+  sha256sum "${state_file}" | awk '{print $1}'
+}
+
+homebrew-overlay-fast-view-current() {
+  local prefix="$1"
+  local base_prefix="$2"
+  local state_file="$3"
+  local expected_digest="$4"
+  local actual_digest status
+
+  actual_digest="$(homebrew-overlay-state-digest "${state_file}")" || return 2
+  [[ "${actual_digest}" == "${expected_digest}" ]] || return 1
+  if homebrew-overlay-state-links-match "${prefix}" "${base_prefix}" "${state_file}"
+  then
+    status=0
+  else
+    status=$?
+  fi
+  [[ "${status}" -ne 2 ]] || return 2
+  return "${status}"
 }
 
 homebrew-overlay-link-matches() {
@@ -671,8 +847,9 @@ homebrew-overlay-ensure-parent() {
 
 homebrew-overlay-apply-view() {
   local prefix="$1"
-  local desired_file="$2"
-  local state_file="$3"
+  local base_prefix="$2"
+  local desired_file="$3"
+  local state_file="$4"
   local relative target destination old_target parent index group_index
   local -A old_view=()
   local -A desired_view=()
@@ -681,19 +858,26 @@ homebrew-overlay-apply-view() {
   local -a remove_paths=()
   local -a add_targets=()
   local -a group_targets=()
-  local temporary_state="${state_file}.tmp.$$.$RANDOM"
+  local temporary_state
 
-  homebrew-overlay-load-state "${state_file}" old_view || {
+  homebrew-overlay-load-state "${state_file}" old_view "${base_prefix}" || {
     echo "Error: invalid overlay view state: ${state_file}" >&2
     return 1
   }
-  homebrew-overlay-load-state "${desired_file}" desired_view || return 1
+  homebrew-overlay-load-state "${desired_file}" desired_view "${base_prefix}" || {
+    echo "Error: invalid desired overlay package view: ${desired_file}" >&2
+    return 1
+  }
 
   # Validate the complete transition before changing any path. Managed links
   # are the only existing entries that may be replaced or removed.
   for relative in "${!desired_view[@]}"
   do
     target="${desired_view[${relative}]}"
+    homebrew-overlay-desired-target-valid "${base_prefix}" "${relative}" "${target}" || {
+      echo "Error: unsafe inherited package-view target: ${target}" >&2
+      return 1
+    }
     destination="${prefix}/${relative}"
     parent="${destination%/*}"
     if [[ -z "${checked_parents[${parent}]-}" ]]
@@ -758,6 +942,7 @@ homebrew-overlay-apply-view() {
       ln -s --target-directory="${parent}" -- "${group_targets[@]}" || return 1
   done
 
+  temporary_state="$(homebrew-overlay-private-temporary "${state_file}")" || return 1
   : >"${temporary_state}" || return 1
   for relative in "${!desired_view[@]}"
   do
@@ -767,11 +952,10 @@ homebrew-overlay-apply-view() {
       return 1
     }
   done
-  chmod 0600 "${temporary_state}" || {
+  homebrew-overlay-publish-temporary "${temporary_state}" "${state_file}" 0600 || {
     rm -f -- "${temporary_state}"
     return 1
   }
-  mv -fT -- "${temporary_state}" "${state_file}" || return 1
 }
 
 homebrew-overlay-structural-view-key() {
@@ -864,7 +1048,7 @@ homebrew-overlay-update-base-drift() {
   local state_dir="${prefix}/var/homebrew/overlay"
   local state_file="${state_dir}/base-drift.state"
   local warned_file="${state_dir}/base-drift.warned"
-  local temporary="${state_file}.tmp.$$.$RANDOM"
+  local temporary
   local rack version formula_name version_name marker recorded relative warning_key old_warning=""
 
   homebrew-overlay-base-generation-valid "${base_key}" || return 1
@@ -877,6 +1061,7 @@ homebrew-overlay-update-base-drift() {
       return 1
     fi
   done
+  temporary="$(homebrew-overlay-private-temporary "${state_file}")" || return 1
   : >"${temporary}" || return 1
   for rack in "${prefix}/Cellar"/*
   do
@@ -921,11 +1106,10 @@ homebrew-overlay-update-base-drift() {
     done
   done
 
-  chmod 0600 "${temporary}" || {
+  homebrew-overlay-publish-temporary "${temporary}" "${state_file}" 0600 || {
     rm -f -- "${temporary}"
     return 1
   }
-  mv -fT -- "${temporary}" "${state_file}" || return 1
 
   if [[ -s "${state_file}" ]]
   then
@@ -948,24 +1132,44 @@ homebrew-overlay-sync-transaction-dir() {
 
 homebrew-overlay-recover-sync() {
   local prefix="$1"
+  local base_prefix="$2"
   local transaction_dir state desired state_file
+  local state_present=0 desired_present=0
+  local -a state_lines=()
   HOMEBREW_OVERLAY_SYNC_RECOVERED=0
   transaction_dir="$(homebrew-overlay-sync-transaction-dir)"
   state="${transaction_dir}/state"
   desired="${transaction_dir}/desired"
   state_file="$(homebrew-overlay-state-file)"
 
-  [[ -e "${state}" || -e "${desired}" ]] || return 0
-  [[ -f "${state}" && ! -L "${state}" && -f "${desired}" && ! -L "${desired}" ]] || {
+  [[ -e "${state}" || -L "${state}" ]] && state_present=1
+  [[ -e "${desired}" || -L "${desired}" ]] && desired_present=1
+  ((state_present == 1 || desired_present == 1)) || return 0
+  if ((state_present == 1))
+  then
+    [[ -f "${state}" && ! -L "${state}" && -O "${state}" &&
+       "$(stat -Lc '%h' -- "${state}")" == 1 ]] || {
+      echo "Error: unsafe overlay synchronization transaction state: ${state}" >&2
+      return 1
+    }
+    mapfile -t state_lines <"${state}" || return 1
+    [[ "${#state_lines[@]}" -eq 1 && "${state_lines[0]}" == applying ]] || {
+      echo "Error: invalid overlay synchronization transaction state" >&2
+      return 1
+    }
+  fi
+  ((desired_present == 1)) || {
     echo "Error: incomplete overlay synchronization transaction: ${transaction_dir}" >&2
     return 1
   }
-  grep -Fqx 'applying' "${state}" || {
-    echo "Error: invalid overlay synchronization transaction state" >&2
+  [[ -f "${desired}" && ! -L "${desired}" && -O "${desired}" &&
+     "$(stat -Lc '%h' -- "${desired}")" == 1 ]] || {
+    echo "Error: unsafe overlay synchronization transaction payload: ${desired}" >&2
     return 1
   }
-  homebrew-overlay-apply-view "${prefix}" "${desired}" "${state_file}" || return 1
-  rm -f -- "${state}" "${desired}" || return 1
+  homebrew-overlay-apply-view "${prefix}" "${base_prefix}" "${desired}" "${state_file}" || return 1
+  ((state_present == 0)) || homebrew-overlay-remove-durable "${state}" || return 1
+  homebrew-overlay-remove-durable "${desired}" || return 1
   HOMEBREW_OVERLAY_SYNC_RECOVERED=1
 }
 
@@ -1287,19 +1491,18 @@ homebrew-overlay-recover-formula-transactions() {
     rm -f -- "${owner_lock}" || return 1
     exec {owner_lock_fd}>&-
   done
-  rmdir "${lock_dir}" 2>/dev/null || true
-  rmdir "${prefix}/Cellar/.homebrew-overlay-staging" \
-        "${prefix}/Cellar/.homebrew-overlay-racks" \
-        "${prefix}/Cellar/.homebrew-overlay-failed" 2>/dev/null || true
+  # Keep validated empty control directories. Removing and recreating them on
+  # every read-only command adds filesystem churn and reopens avoidable races.
 }
 
 homebrew-overlay-sync-unlocked() {
   local force="${1:-0}"
   local prefix configured_base base_prefix state_dir state_file stamp_file
-  local base_key local_key old_base="" old_local=""
-  local local_dirty=0 finalize_mutation=0 mutation_status=0
+  local base_key local_key old_base="" old_local="" old_state_digest="" state_digest status
+  local local_dirty=0 finalize_mutation=0
   local base_dirty_file local_dirty_file
-  local desired transaction_dir transaction_state transaction_desired temporary_stamp
+  local desired transaction_dir transaction_state transaction_desired
+  local -a stamp_lines=()
 
   homebrew-overlay-truthy "${HOMEBREW_OVERLAY_FINALIZE_MUTATION:-}" && finalize_mutation=1
 
@@ -1327,7 +1530,7 @@ homebrew-overlay-sync-unlocked() {
     echo "Error: another Homebrew overlay formula transaction is still active; retry after it finishes" >&2
     return 1
   fi
-  homebrew-overlay-recover-sync "${prefix}" || return 1
+  homebrew-overlay-recover-sync "${prefix}" "${base_prefix}" || return 1
 
   if [[ "${HOMEBREW_OVERLAY_FORMULA_RECOVERED:-0}" -eq 1 ]]
   then
@@ -1355,14 +1558,38 @@ homebrew-overlay-sync-unlocked() {
 
   base_key="$(homebrew-overlay-view-key "${base_prefix}")" || return 1
   local_key="$(homebrew-overlay-view-key "${prefix}")" || return 1
-  if [[ "${force}" -eq 0 && -f "${stamp_file}" && ! -L "${stamp_file}" &&
-        -f "${state_file}" && ! -L "${state_file}" ]]
+  if [[ "${force}" -eq 0 && ( -e "${stamp_file}" || -L "${stamp_file}" ) ]]
   then
-    IFS= read -r old_base <"${stamp_file}" || true
-    IFS= read -r old_local < <(sed -n '2p' "${stamp_file}") || true
-    if [[ "${old_base}" == "${base_key}" && "${old_local}" == "${local_key}" ]]
+    [[ -f "${stamp_file}" && ! -L "${stamp_file}" && -O "${stamp_file}" && -r "${stamp_file}" &&
+       "$(stat -Lc '%h' -- "${stamp_file}")" == 1 ]] || {
+      echo "Error: unsafe overlay view stamp: ${stamp_file}" >&2
+      return 1
+    }
+    mapfile -t stamp_lines <"${stamp_file}" || return 1
+    if ((${#stamp_lines[@]} == 3))
     then
-      return 0
+      old_base="${stamp_lines[0]}"
+      old_local="${stamp_lines[1]}"
+      old_state_digest="${stamp_lines[2]}"
+      if [[ "${old_base}" == "${base_key}" && "${old_local}" == "${local_key}" ]] &&
+         homebrew-overlay-base-generation-valid "${old_state_digest}"
+      then
+        if homebrew-overlay-fast-view-current \
+          "${prefix}" "${base_prefix}" "${state_file}" "${old_state_digest}"
+        then
+          status=0
+        else
+          status=$?
+        fi
+        case "${status}" in
+          0) return 0 ;;
+          1) force=1 ;;
+          *)
+            echo "Error: invalid overlay view state: ${state_file}" >&2
+            return 1
+            ;;
+        esac
+      fi
     fi
   fi
 
@@ -1371,7 +1598,7 @@ homebrew-overlay-sync-unlocked() {
   # committed stamp, so avoid scanning every local keg on read-only commands.
   homebrew-overlay-update-base-drift "${prefix}" "${base_key}" || return 1
 
-  desired="${state_dir}/view.desired.$$.$RANDOM"
+  desired="$(homebrew-overlay-private-temporary "${state_dir}/view.desired")" || return 1
   homebrew-overlay-build-view "${prefix}" "${base_prefix}" "${desired}" || {
     rm -f -- "${desired}"
     return 1
@@ -1384,15 +1611,21 @@ homebrew-overlay-sync-unlocked() {
     rm -f -- "${desired}"
     return 1
   }
-  [[ ! -e "${transaction_state}" && ! -e "${transaction_desired}" ]] || {
+  [[ ! -e "${transaction_state}" && ! -L "${transaction_state}" &&
+     ! -e "${transaction_desired}" && ! -L "${transaction_desired}" ]] || {
     rm -f -- "${desired}"
     echo "Error: overlay synchronization transaction was not recovered" >&2
     return 1
   }
-  mv -fT -- "${desired}" "${transaction_desired}" || return 1
+  homebrew-overlay-publish-temporary "${desired}" "${transaction_desired}" 0600 || {
+    rm -f -- "${desired}"
+    return 1
+  }
   homebrew-overlay-atomic-write "${transaction_state}" 0600 <<<'applying' || return 1
-  homebrew-overlay-apply-view "${prefix}" "${transaction_desired}" "${state_file}" || return 1
-  rm -f -- "${transaction_state}" "${transaction_desired}" || return 1
+  homebrew-overlay-apply-view \
+    "${prefix}" "${base_prefix}" "${transaction_desired}" "${state_file}" || return 1
+  homebrew-overlay-remove-durable "${transaction_state}" || return 1
+  homebrew-overlay-remove-durable "${transaction_desired}" || return 1
 
   # A dirty local generation belongs either to this explicitly finalizing
   # mutation or to a crashed process whose global mutation lock was acquired by
@@ -1408,25 +1641,34 @@ homebrew-overlay-sync-unlocked() {
   # Store the package generations that produced the reconciled inherited view.
   # A dirty administrator generation remains structural until an administrator
   # invocation acquires its mutation lock and recovers the explicit marker.
-  temporary_stamp="${stamp_file}.tmp.$$.$RANDOM"
-  printf '%s\n%s\n' "${base_key}" "${local_key}" >"${temporary_stamp}" || return 1
-  chmod 0600 "${temporary_stamp}" || {
-    rm -f -- "${temporary_stamp}"
-    return 1
-  }
-  mv -fT -- "${temporary_stamp}" "${stamp_file}" || return 1
+  state_digest="$(homebrew-overlay-state-digest "${state_file}")" || return 1
+  homebrew-overlay-atomic-write "${stamp_file}" 0600 <<EOF_STAMP
+${base_key}
+${local_key}
+${state_digest}
+EOF_STAMP
 }
 
 homebrew-overlay-sync() {
   local force=0
-  local lock_file mutation_lock base_lock base_prefix base_owner
+  local lock_file mutation_lock base_lock prefix base_prefix base_owner
   local owner="${HOMEBREW_OVERLAY_MUTATION_OWNER:-}"
   [[ "${1:-}" == "--force" ]] && force=1
+  prefix="$(homebrew-overlay-normalize-absolute "${HOMEBREW_PREFIX}")" || return 1
   base_prefix="$(homebrew-overlay-normalize-absolute \
     "$(homebrew-overlay-expand-home "${HOMEBREW_OVERLAY_BASE_PREFIX:-}")")" || return 1
-  [[ "${base_prefix}" != "${HOMEBREW_PREFIX}" ]] || return 1
-  lock_file="$(homebrew-overlay-prepare-sync-lock "${HOMEBREW_PREFIX}")" || return 1
-  mutation_lock="$(homebrew-overlay-prepare-mutation-lock "${HOMEBREW_PREFIX}")" || return 1
+  [[ "${base_prefix}" != "${prefix}" ]] || return 1
+  homebrew-overlay-prefix-owned-and-writable "${prefix}" || return 1
+  [[ -d "${prefix}/Cellar" && ! -L "${prefix}/Cellar" ]] || {
+    echo "Error: user overlay Cellar is not a real directory: ${prefix}/Cellar" >&2
+    return 1
+  }
+  [[ -d "${base_prefix}/Cellar" && ! -L "${base_prefix}/Cellar" && -r "${base_prefix}/Cellar" ]] || {
+    echo "Error: administrator Cellar is not a readable real directory: ${base_prefix}/Cellar" >&2
+    return 1
+  }
+  lock_file="$(homebrew-overlay-prepare-sync-lock "${prefix}")" || return 1
+  mutation_lock="$(homebrew-overlay-prepare-mutation-lock "${prefix}")" || return 1
   base_lock="$(homebrew-overlay-existing-base-mutation-lock "${base_prefix}")" || return 1
   base_owner="$(stat -Lc '%u' -- "${base_prefix}")" || return 1
 
@@ -1440,11 +1682,11 @@ homebrew-overlay-sync() {
       echo "Error: unsafe administrator Homebrew mutation lock descriptor" >&2
       exit 1
     }
-    homebrew-overlay-lock-fd-valid 8 "${mutation_lock}" "$(id -u)" || {
+    homebrew-overlay-lock-fd-valid 8 "${mutation_lock}" "${EUID}" || {
       echo "Error: unsafe Homebrew overlay mutation lock descriptor" >&2
       exit 1
     }
-    homebrew-overlay-lock-fd-valid 9 "${lock_file}" "$(id -u)" || {
+    homebrew-overlay-lock-fd-valid 9 "${lock_file}" "${EUID}" || {
       echo "Error: unsafe Homebrew overlay synchronization lock descriptor" >&2
       exit 1
     }
