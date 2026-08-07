@@ -713,6 +713,10 @@ homebrew-overlay-fast-view-current() {
   local expected_digest="$4"
   local actual_digest status
 
+  # A missing state file carries no authorization to remove anything, but the
+  # exact live links can be reconstructed during a full reconciliation. Other
+  # unsafe state objects remain hard errors.
+  [[ -e "${state_file}" || -L "${state_file}" ]] || return 1
   actual_digest="$(homebrew-overlay-state-digest "${state_file}")" || return 2
   [[ "${actual_digest}" == "${expected_digest}" ]] || return 1
   if homebrew-overlay-state-links-match "${prefix}" "${base_prefix}" "${state_file}"
@@ -741,6 +745,187 @@ homebrew-overlay-rack-has-local-version() {
     [[ -L "${version}" ]] || return 0
   done
   return 1
+}
+
+homebrew-overlay-user-cellar-alias-valid() {
+  local alias_path="$1"
+  local user_cellar="$2"
+  local resolved name
+
+  [[ -L "${alias_path}" && -e "${alias_path}" ]] || return 1
+  resolved="$(readlink -f -- "${alias_path}")" || return 1
+  [[ "${resolved%/*}" == "${user_cellar}" ]] || return 1
+  name="${resolved##*/}"
+  homebrew-overlay-formula-name-valid "${name}" || return 1
+  [[ -d "${resolved}" && ! -L "${resolved}" ]]
+}
+
+# Reconstruct the managed Cellar portion of view.state from the live package
+# tree. This makes reconciliation converge even when the state file was lost:
+# exact lower-prefix links can be adopted or removed, while every other object
+# in a real rack must be a native local keg directory.
+homebrew-overlay-discover-managed-view() {
+  local prefix="$1"
+  local base_prefix="$2"
+  local array_name="$3"
+  local user_cellar="${prefix}/Cellar"
+  local entry child name version relative expected namespace root listing target kind
+  local link_index
+  local -n output_map="${array_name}"
+  local -a cellar_entries=(
+    "${user_cellar}"/*
+    "${user_cellar}"/.[!.]*
+    "${user_cellar}"/..?*
+  )
+  local -a rack_entries=()
+  local -a namespace_entries=()
+  local -a link_paths=()
+  local -a link_relatives=()
+  local -a link_expected=()
+  local -a link_kinds=()
+  local -a link_targets=()
+
+  output_map=()
+  [[ -d "${user_cellar}" && ! -L "${user_cellar}" && -O "${user_cellar}" ]] || return 1
+
+  for entry in "${cellar_entries[@]}"
+  do
+    [[ -e "${entry}" || -L "${entry}" ]] || continue
+    name="${entry##*/}"
+    case "${name}" in
+      .homebrew-overlay-staging | .homebrew-overlay-racks | .homebrew-overlay-failed)
+        [[ -d "${entry}" && ! -L "${entry}" && -O "${entry}" ]] || {
+          echo "Error: unsafe overlay Cellar control directory: ${entry}" >&2
+          return 1
+        }
+        continue
+        ;;
+    esac
+
+    homebrew-overlay-formula-name-valid "${name}" || {
+      echo "Error: invalid formula rack in user overlay: ${entry}" >&2
+      return 1
+    }
+    relative="Cellar/${name}"
+    expected="${base_prefix}/${relative}"
+
+    if [[ -L "${entry}" ]]
+    then
+      link_paths+=("${entry}")
+      link_relatives+=("${relative}")
+      link_expected+=("${expected}")
+      link_kinds+=(cellar-rack)
+      continue
+    fi
+
+    [[ -d "${entry}" && -O "${entry}" ]] || {
+      echo "Error: invalid formula rack in user overlay: ${entry}" >&2
+      return 1
+    }
+    rack_entries=(
+      "${entry}"/*
+      "${entry}"/.[!.]*
+      "${entry}"/..?*
+    )
+    for child in "${rack_entries[@]}"
+    do
+      [[ -e "${child}" || -L "${child}" ]] || continue
+      version="${child##*/}"
+      homebrew-overlay-valid-relative-path "${version}" || return 1
+      [[ "${version}" != */* ]] || return 1
+      relative="Cellar/${name}/${version}"
+      expected="${base_prefix}/${relative}"
+      if [[ -L "${child}" ]]
+      then
+        link_paths+=("${child}")
+        link_relatives+=("${relative}")
+        link_expected+=("${expected}")
+        link_kinds+=(cellar-version)
+      elif [[ ! -d "${child}" || ! -O "${child}" ]]
+      then
+        echo "Error: invalid version entry in user overlay rack: ${child}" >&2
+        return 1
+      fi
+    done
+  done
+
+  # opt and linked-keg records have native user-owned counterparts, so inspect
+  # only links whose literal target proves they belong to this overlay. Those
+  # exact links remain safely removable after lower metadata or view.state is
+  # lost; unrelated local records are left alone.
+  for namespace in opt var/homebrew/linked
+  do
+    root="${prefix}/${namespace}"
+    homebrew-overlay-safe-mkdir "${prefix}" "${root}" || {
+      echo "Error: unsafe parent blocks inherited package view: ${root}" >&2
+      return 1
+    }
+    namespace_entries=("${root}"/*)
+    for entry in "${namespace_entries[@]}"
+    do
+      [[ -e "${entry}" || -L "${entry}" ]] || continue
+      [[ -L "${entry}" ]] || continue
+      name="${entry##*/}"
+      homebrew-overlay-formula-name-valid "${name}" || continue
+      relative="${namespace}/${name}"
+      expected="${base_prefix}/${relative}"
+      link_paths+=("${entry}")
+      link_relatives+=("${relative}")
+      link_expected+=("${expected}")
+      link_kinds+=(namespace)
+    done
+  done
+
+  # readlink(1) accepts all paths in one call. Full reconciliation therefore
+  # remains linear without spawning one process for every inherited package.
+  if ((${#link_paths[@]} > 0))
+  then
+    listing="$(mktemp "${TMPDIR:-/tmp}/homebrew-overlay-readlinks.XXXXXX")" || return 1
+    readlink -z -- "${link_paths[@]}" >"${listing}" || {
+      rm -f -- "${listing}"
+      return 1
+    }
+    mapfile -d '' -t link_targets <"${listing}" || {
+      rm -f -- "${listing}"
+      return 1
+    }
+    rm -f -- "${listing}" || return 1
+    [[ "${#link_targets[@]}" -eq "${#link_paths[@]}" ]] || return 1
+  fi
+
+  for ((link_index = 0; link_index < ${#link_paths[@]}; link_index++))
+  do
+    entry="${link_paths[${link_index}]}"
+    relative="${link_relatives[${link_index}]}"
+    expected="${link_expected[${link_index}]}"
+    kind="${link_kinds[${link_index}]}"
+    target="${link_targets[${link_index}]}"
+    case "${kind}" in
+      cellar-rack)
+        if [[ "${target}" == "${expected}" ]]
+        then
+          output_map["${relative}"]="${expected}"
+        elif ! homebrew-overlay-user-cellar-alias-valid "${entry}" "${user_cellar}"
+        then
+          echo "Error: user-owned path conflicts with inherited package view: ${entry}" >&2
+          return 1
+        fi
+        ;;
+      cellar-version)
+        if [[ "${target}" != "${expected}" ]]
+        then
+          echo "Error: user-owned path conflicts with inherited package view: ${entry}" >&2
+          return 1
+        fi
+        output_map["${relative}"]="${expected}"
+        ;;
+      namespace)
+        [[ "${target}" == "${expected}" ]] || continue
+        output_map["${relative}"]="${expected}"
+        ;;
+      *) return 1 ;;
+    esac
+  done
 }
 
 homebrew-overlay-build-view() {
@@ -853,6 +1038,7 @@ homebrew-overlay-apply-view() {
   local relative target destination old_target parent index group_index
   local -A old_view=()
   local -A desired_view=()
+  local -A discovered_view=()
   local -A add_groups=()
   local -A checked_parents=()
   local -a remove_paths=()
@@ -868,6 +1054,11 @@ homebrew-overlay-apply-view() {
     echo "Error: invalid desired overlay package view: ${desired_file}" >&2
     return 1
   }
+  homebrew-overlay-discover-managed-view "${prefix}" "${base_prefix}" discovered_view || return 1
+  for relative in "${!discovered_view[@]}"
+  do
+    old_view["${relative}"]="${discovered_view[${relative}]}"
+  done
 
   # Validate the complete transition before changing any path. Managed links
   # are the only existing entries that may be replaced or removed.
