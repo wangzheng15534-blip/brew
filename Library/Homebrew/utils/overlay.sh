@@ -1207,20 +1207,119 @@ homebrew-overlay-transaction-marker-id() {
 
   if [[ -e "${marker}" || -L "${marker}" ]]
   then
-    [[ -f "${marker}" && ! -L "${marker}" ]] || {
+    marker_id="$(homebrew-overlay-read-owned-line "${marker}")" || {
       echo "Error: unsafe overlay formula transaction marker: ${marker}" >&2
       return 1
     }
-    IFS= read -r marker_id <"${marker}" || return 1
     [[ "${marker_id}" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
   fi
   printf '%s\n' "${marker_id}"
+}
+
+homebrew-overlay-read-owned-line() {
+  local file="$1"
+  local file_fd value extra="" byte_count
+  local LC_ALL=C
+
+  [[ -f "${file}" && ! -L "${file}" && -O "${file}" && -r "${file}" ]] || return 1
+  exec {file_fd}<"${file}" || return 1
+  homebrew-overlay-lock-fd-valid "${file_fd}" "${file}" "${EUID}" || {
+    exec {file_fd}>&-
+    return 1
+  }
+  IFS= read -r -u "${file_fd}" value || {
+    exec {file_fd}>&-
+    return 1
+  }
+  if IFS= read -r -u "${file_fd}" extra || [[ -n "${extra}" ]]
+  then
+    exec {file_fd}>&-
+    return 1
+  fi
+  byte_count="$(stat -Lc '%s' -- "/proc/self/fd/${file_fd}")" || {
+    exec {file_fd}>&-
+    return 1
+  }
+  [[ "${byte_count}" -eq $(( ${#value} + 1 )) ]] || {
+    exec {file_fd}>&-
+    return 1
+  }
+  homebrew-overlay-lock-fd-valid "${file_fd}" "${file}" "${EUID}" || {
+    exec {file_fd}>&-
+    return 1
+  }
+  exec {file_fd}>&-
+  printf '%s\n' "${value}"
+}
+
+homebrew-overlay-rack-is-exact-inherited-view() {
+  local base_rack="$1"
+  local local_rack="$2"
+  local base_version local_version version resolved expected
+  local base_count=0 local_count=0
+  local -a base_entries=(
+    "${base_rack}"/*
+    "${base_rack}"/.[!.]*
+    "${base_rack}"/..?*
+  )
+  local -a local_entries=()
+
+  [[ -d "${base_rack}" && ! -L "${base_rack}" ]] || return 1
+  if [[ -L "${local_rack}" ]]
+  then
+    [[ -e "${local_rack}" ]] || return 1
+    resolved="$(readlink -f -- "${local_rack}")" || return 1
+    expected="$(readlink -f -- "${base_rack}")" || return 1
+    [[ "${resolved}" == "${expected}" ]]
+    return
+  fi
+
+  [[ -d "${local_rack}" && ! -L "${local_rack}" && -O "${local_rack}" ]] || return 1
+  for base_version in "${base_entries[@]}"
+  do
+    [[ -e "${base_version}" || -L "${base_version}" ]] || continue
+    [[ -d "${base_version}" && ! -L "${base_version}" ]] || continue
+    version="${base_version##*/}"
+    homebrew-overlay-valid-relative-path "${version}" || return 1
+    [[ "${version}" != */* ]] || return 1
+    local_version="${local_rack}/${version}"
+    [[ -L "${local_version}" && -e "${local_version}" ]] || return 1
+    resolved="$(readlink -f -- "${local_version}")" || return 1
+    expected="$(readlink -f -- "${base_version}")" || return 1
+    [[ "${resolved}" == "${expected}" ]] || return 1
+    base_count=$((base_count + 1))
+  done
+  ((base_count > 0)) || return 1
+
+  local_entries=(
+    "${local_rack}"/*
+    "${local_rack}"/.[!.]*
+    "${local_rack}"/..?*
+  )
+  for local_version in "${local_entries[@]}"
+  do
+    [[ -e "${local_version}" || -L "${local_version}" ]] || continue
+    [[ -L "${local_version}" && -e "${local_version}" ]] || return 1
+    version="${local_version##*/}"
+    homebrew-overlay-valid-relative-path "${version}" || return 1
+    [[ "${version}" != */* ]] || return 1
+    base_version="${base_rack}/${version}"
+    [[ -d "${base_version}" && ! -L "${base_version}" ]] || return 1
+    resolved="$(readlink -f -- "${local_version}")" || return 1
+    expected="$(readlink -f -- "${base_version}")" || return 1
+    [[ "${resolved}" == "${expected}" ]] || return 1
+    local_count=$((local_count + 1))
+  done
+  [[ "${local_count}" -eq "${base_count}" ]]
 }
 
 homebrew-overlay-recover-formula-transactions() {
   local prefix="$1"
   local base_prefix="$2"
   local transactions="${prefix}/var/homebrew/overlay/transactions"
+  local staging_parent="${prefix}/Cellar/.homebrew-overlay-staging"
+  local replacement_parent="${prefix}/Cellar/.homebrew-overlay-racks"
+  local failed_parent="${prefix}/Cellar/.homebrew-overlay-failed"
   local transaction pending_name id formula version state base_generation base_rack local_rack final_version
   local staging_root staging_version replacement_root replacement_rack replacement_version
   local failed_root failed_rack failed_version final_marker replacement_marker failed_marker
@@ -1232,6 +1331,12 @@ homebrew-overlay-recover-formula-transactions() {
   homebrew-overlay-safe-mkdir "${prefix}" "${transactions}" || return 1
   lock_dir="${transactions}/.locks"
   homebrew-overlay-safe-mkdir "${prefix}" "${lock_dir}" || return 1
+  # Validate every hidden cleanup parent before reading a journal. Lexical
+  # confinement alone is insufficient because an intermediate symlink would
+  # redirect rm(1) outside the overlay prefix.
+  homebrew-overlay-safe-mkdir "${prefix}" "${staging_parent}" || return 1
+  homebrew-overlay-safe-mkdir "${prefix}" "${replacement_parent}" || return 1
+  homebrew-overlay-safe-mkdir "${prefix}" "${failed_parent}" || return 1
 
   # FormulaTransaction publishes journals by renaming a complete hidden
   # .new-<id> directory to <id>. A crash before that rename may leave only the
@@ -1256,11 +1361,16 @@ homebrew-overlay-recover-formula-transactions() {
     then
       (umask 077; set -o noclobber; : >"${owner_lock}") 2>/dev/null || true
     fi
-    [[ -f "${owner_lock}" && ! -L "${owner_lock}" && -O "${owner_lock}" ]] || {
+    homebrew-overlay-lock-path-valid "${owner_lock}" "${EUID}" || {
       echo "Error: unsafe pending overlay transaction owner lock: ${owner_lock}" >&2
       return 1
     }
     exec {owner_lock_fd}<>"${owner_lock}" || return 1
+    homebrew-overlay-lock-fd-valid "${owner_lock_fd}" "${owner_lock}" "${EUID}" || {
+      exec {owner_lock_fd}>&-
+      echo "Error: unsafe pending overlay transaction owner lock descriptor: ${owner_lock}" >&2
+      return 1
+    }
     if ! flock -x -n "${owner_lock_fd}"
     then
       HOMEBREW_OVERLAY_FORMULA_ACTIVE=1
@@ -1269,13 +1379,17 @@ homebrew-overlay-recover-formula-transactions() {
     fi
 
     HOMEBREW_OVERLAY_FORMULA_RECOVERED=1
-    staging_root="${prefix}/Cellar/.homebrew-overlay-staging/${id}"
-    replacement_root="${prefix}/Cellar/.homebrew-overlay-racks/${id}"
-    failed_root="${prefix}/Cellar/.homebrew-overlay-failed/${id}"
-    homebrew-overlay-path-under "${staging_root}" "${prefix}/Cellar/.homebrew-overlay-staging" || return 1
-    homebrew-overlay-path-under "${replacement_root}" "${prefix}/Cellar/.homebrew-overlay-racks" || return 1
-    homebrew-overlay-path-under "${failed_root}" "${prefix}/Cellar/.homebrew-overlay-failed" || return 1
+    staging_root="${staging_parent}/${id}"
+    replacement_root="${replacement_parent}/${id}"
+    failed_root="${failed_parent}/${id}"
+    homebrew-overlay-path-under "${staging_root}" "${staging_parent}" || return 1
+    homebrew-overlay-path-under "${replacement_root}" "${replacement_parent}" || return 1
+    homebrew-overlay-path-under "${failed_root}" "${failed_parent}" || return 1
     rm -rf --one-file-system -- "${staging_root}" "${replacement_root}" "${failed_root}" "${transaction}" || return 1
+    homebrew-overlay-lock-fd-valid "${owner_lock_fd}" "${owner_lock}" "${EUID}" || {
+      exec {owner_lock_fd}>&-
+      return 1
+    }
     rm -f -- "${owner_lock}" || return 1
     exec {owner_lock_fd}>&-
   done
@@ -1283,7 +1397,7 @@ homebrew-overlay-recover-formula-transactions() {
   for transaction in "${transactions}"/*
   do
     [[ -e "${transaction}" || -L "${transaction}" ]] || continue
-    if [[ ! -d "${transaction}" || -L "${transaction}" ]]
+    if [[ ! -d "${transaction}" || -L "${transaction}" || ! -O "${transaction}" ]]
     then
       echo "Error: unsafe overlay transaction entry: ${transaction}" >&2
       return 1
@@ -1296,11 +1410,16 @@ homebrew-overlay-recover-formula-transactions() {
     then
       (umask 077; set -o noclobber; : >"${owner_lock}") 2>/dev/null || true
     fi
-    [[ -f "${owner_lock}" && ! -L "${owner_lock}" && -O "${owner_lock}" ]] || {
+    homebrew-overlay-lock-path-valid "${owner_lock}" "${EUID}" || {
       echo "Error: unsafe overlay transaction owner lock: ${owner_lock}" >&2
       return 1
     }
     exec {owner_lock_fd}<>"${owner_lock}" || return 1
+    homebrew-overlay-lock-fd-valid "${owner_lock_fd}" "${owner_lock}" "${EUID}" || {
+      exec {owner_lock_fd}>&-
+      echo "Error: unsafe overlay transaction owner lock descriptor: ${owner_lock}" >&2
+      return 1
+    }
     if ! flock -x -n "${owner_lock_fd}"
     then
       if [[ "${id}" != "${HOMEBREW_OVERLAY_OWNER_TRANSACTION_ID:-}" ]]
@@ -1319,10 +1438,22 @@ homebrew-overlay-recover-formula-transactions() {
       echo "Error: incomplete overlay formula transaction: ${transaction}" >&2
       return 1
     }
-    IFS= read -r formula <"${transaction}/formula" || return 1
-    IFS= read -r version <"${transaction}/version" || return 1
-    IFS= read -r base_generation <"${transaction}/base_generation" || return 1
-    IFS= read -r state <"${transaction}/state" || return 1
+    formula="$(homebrew-overlay-read-owned-line "${transaction}/formula")" || {
+      echo "Error: unsafe overlay formula transaction metadata: ${transaction}/formula" >&2
+      return 1
+    }
+    version="$(homebrew-overlay-read-owned-line "${transaction}/version")" || {
+      echo "Error: unsafe overlay formula transaction metadata: ${transaction}/version" >&2
+      return 1
+    }
+    base_generation="$(homebrew-overlay-read-owned-line "${transaction}/base_generation")" || {
+      echo "Error: unsafe overlay formula transaction metadata: ${transaction}/base_generation" >&2
+      return 1
+    }
+    state="$(homebrew-overlay-read-owned-line "${transaction}/state")" || {
+      echo "Error: unsafe overlay formula transaction metadata: ${transaction}/state" >&2
+      return 1
+    }
     homebrew-overlay-formula-name-valid "${formula}" || return 1
     homebrew-overlay-valid-relative-path "${version}" || return 1
     [[ "${version}" != */* ]] || return 1
@@ -1331,12 +1462,12 @@ homebrew-overlay-recover-formula-transactions() {
     base_rack="${base_prefix}/Cellar/${formula}"
     local_rack="${prefix}/Cellar/${formula}"
     final_version="${local_rack}/${version}"
-    staging_root="${prefix}/Cellar/.homebrew-overlay-staging/${id}"
+    staging_root="${staging_parent}/${id}"
     staging_version="${staging_root}/${formula}/${version}"
-    replacement_root="${prefix}/Cellar/.homebrew-overlay-racks/${id}"
+    replacement_root="${replacement_parent}/${id}"
     replacement_rack="${replacement_root}/${formula}"
     replacement_version="${replacement_rack}/${version}"
-    failed_root="${prefix}/Cellar/.homebrew-overlay-failed/${id}"
+    failed_root="${failed_parent}/${id}"
     failed_rack="${failed_root}/${formula}"
     failed_version="${failed_rack}/${version}"
     final_marker="${final_version}/.brew-overlay-transaction"
@@ -1376,6 +1507,14 @@ homebrew-overlay-recover-formula-transactions() {
         then
           # Publication never exchanged the rack, or rollback already did.
           :
+        elif [[ -z "${final_marker_id}" && -z "${replacement_marker_id}" &&
+                -z "${failed_marker_id}" ]] &&
+             homebrew-overlay-rack-is-exact-inherited-view "${base_rack}" "${local_rack}"
+        then
+          # Cleanup may have removed the transaction-owned rack before it
+          # removed the journal. The restored inherited view is the durable
+          # proof that rollback already crossed that point.
+          :
         else
           echo "Error: transaction ${id} does not own either recovery rack" >&2
           return 1
@@ -1400,8 +1539,15 @@ homebrew-overlay-recover-formula-transactions() {
         fi
         if [[ "${failed_marker_id}" != "${id}" ]]
         then
-          echo "Error: transaction ${id} has no failed rack to clean" >&2
-          return 1
+          if [[ -z "${final_marker_id}" && -z "${replacement_marker_id}" &&
+                -z "${failed_marker_id}" ]] &&
+             homebrew-overlay-rack-is-exact-inherited-view "${base_rack}" "${local_rack}"
+          then
+            :
+          else
+            echo "Error: transaction ${id} has no failed rack to clean" >&2
+            return 1
+          fi
         fi
         ;;
       committing | committed)
@@ -1416,7 +1562,10 @@ homebrew-overlay-recover-formula-transactions() {
           echo "Error: committed overlay formula has no safe base-generation marker: ${final_version}" >&2
           return 1
         }
-        IFS= read -r recorded_generation <"${base_generation_marker}" || return 1
+        recorded_generation="$(homebrew-overlay-read-owned-line "${base_generation_marker}")" || {
+          echo "Error: committed overlay formula has no safe base-generation marker: ${final_version}" >&2
+          return 1
+        }
         if [[ "${recorded_generation}" != "${base_generation}" ]]
         then
           echo "Error: committed overlay formula has the wrong base generation: ${final_version}" >&2
@@ -1449,12 +1598,23 @@ homebrew-overlay-recover-formula-transactions() {
       [[ -e "${local_rack}" || -L "${local_rack}" ]] || {
         ln -s -- "${base_rack}" "${local_rack}" || return 1
       }
+      homebrew-overlay-rack-is-exact-inherited-view "${base_rack}" "${local_rack}" || {
+        echo "Error: transaction ${id} did not restore an exact inherited rack: ${local_rack}" >&2
+        return 1
+      }
     fi
 
-    homebrew-overlay-path-under "${staging_root}" "${prefix}/Cellar/.homebrew-overlay-staging" || return 1
-    homebrew-overlay-path-under "${replacement_root}" "${prefix}/Cellar/.homebrew-overlay-racks" || return 1
-    homebrew-overlay-path-under "${failed_root}" "${prefix}/Cellar/.homebrew-overlay-failed" || return 1
+    homebrew-overlay-safe-mkdir "${prefix}" "${staging_parent}" || return 1
+    homebrew-overlay-safe-mkdir "${prefix}" "${replacement_parent}" || return 1
+    homebrew-overlay-safe-mkdir "${prefix}" "${failed_parent}" || return 1
+    homebrew-overlay-path-under "${staging_root}" "${staging_parent}" || return 1
+    homebrew-overlay-path-under "${replacement_root}" "${replacement_parent}" || return 1
+    homebrew-overlay-path-under "${failed_root}" "${failed_parent}" || return 1
     rm -rf --one-file-system -- "${staging_root}" "${replacement_root}" "${failed_root}" "${transaction}" || return 1
+    homebrew-overlay-lock-fd-valid "${owner_lock_fd}" "${owner_lock}" "${EUID}" || {
+      exec {owner_lock_fd}>&-
+      return 1
+    }
     rm -f -- "${owner_lock}" || return 1
     exec {owner_lock_fd}>&-
   done
@@ -1466,7 +1626,7 @@ homebrew-overlay-recover-formula-transactions() {
   for owner_lock in "${lock_dir}"/*.lock
   do
     [[ -e "${owner_lock}" || -L "${owner_lock}" ]] || continue
-    [[ -f "${owner_lock}" && ! -L "${owner_lock}" && -O "${owner_lock}" ]] || {
+    homebrew-overlay-lock-path-valid "${owner_lock}" "${EUID}" || {
       echo "Error: unsafe orphan overlay transaction owner lock: ${owner_lock}" >&2
       return 1
     }
@@ -1481,6 +1641,11 @@ homebrew-overlay-recover-formula-transactions() {
       continue
     fi
     exec {owner_lock_fd}<>"${owner_lock}" || return 1
+    homebrew-overlay-lock-fd-valid "${owner_lock_fd}" "${owner_lock}" "${EUID}" || {
+      exec {owner_lock_fd}>&-
+      echo "Error: unsafe orphan overlay transaction owner lock descriptor: ${owner_lock}" >&2
+      return 1
+    }
     if ! flock -x -n "${owner_lock_fd}"
     then
       HOMEBREW_OVERLAY_FORMULA_ACTIVE=1
@@ -1488,6 +1653,10 @@ homebrew-overlay-recover-formula-transactions() {
       continue
     fi
     HOMEBREW_OVERLAY_FORMULA_RECOVERED=1
+    homebrew-overlay-lock-fd-valid "${owner_lock_fd}" "${owner_lock}" "${EUID}" || {
+      exec {owner_lock_fd}>&-
+      return 1
+    }
     rm -f -- "${owner_lock}" || return 1
     exec {owner_lock_fd}>&-
   done

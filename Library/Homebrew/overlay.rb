@@ -142,6 +142,7 @@ module Homebrew
 
         owns_mutation = !Overlay.mutation_active?
         acquire_owner_lock!
+        prepare_control_directories!
         Overlay.begin_mutation! if owns_mutation
         Overlay.verify_base_generation!(base_generation)
         Overlay.ensure_inherited_rack!(formula_name)
@@ -224,7 +225,10 @@ module Homebrew
       sig { params(path: Pathname).returns(T::Boolean) }
       def marker_owned?(path)
         marker = path/TRANSACTION_MARKER
-        marker.file? && !marker.symlink? && marker.read.chomp == id
+        return false unless marker.file? && !marker.symlink?
+
+        stat = marker.lstat
+        stat.uid == Process.uid && stat.nlink == 1 && marker.binread == "#{id}\n"
       end
 
       sig { returns(T::Boolean) }
@@ -256,6 +260,10 @@ module Homebrew
         owner_lock = File.open(@owner_lock_path, flags, 0600)
         @owner_lock = owner_lock
         owner_lock.close_on_exec = true
+        stat = owner_lock.stat
+        unless stat.file? && stat.uid == Process.uid && stat.nlink == 1
+          raise TransactionFailure, "unsafe overlay transaction owner lock: #{@owner_lock_path}"
+        end
         unless owner_lock.flock(File::LOCK_EX | File::LOCK_NB)
           raise TransactionFailure, "could not acquire overlay transaction owner lock: #{@owner_lock_path}"
         end
@@ -269,6 +277,31 @@ module Homebrew
         owner_lock.flock(File::LOCK_UN) unless owner_lock.closed?
         owner_lock.close unless owner_lock.closed?
         @owner_lock = nil
+      end
+
+      sig { void }
+      def prepare_control_directories!
+        Overlay.ensure_owned_directory!(@staging_root.parent)
+        Overlay.ensure_owned_directory!(@replacement_root.parent)
+        Overlay.ensure_owned_directory!(Overlay.transactions_dir)
+        Overlay.ensure_owned_directory!(@owner_lock_path.parent)
+      end
+
+      sig { void }
+      def validate_owner_lock_path!
+        owner_lock = @owner_lock
+        raise TransactionFailure, "overlay transaction owner lock is not open: #{@owner_lock_path}" if owner_lock.nil? || owner_lock.closed?
+        if @owner_lock_path.symlink? || !@owner_lock_path.file?
+          raise TransactionFailure, "unsafe overlay transaction owner lock: #{@owner_lock_path}"
+        end
+
+        descriptor_stat = owner_lock.stat
+        path_stat = @owner_lock_path.lstat
+        unless descriptor_stat.file? && descriptor_stat.uid == Process.uid && descriptor_stat.nlink == 1 &&
+               path_stat.file? && path_stat.uid == Process.uid && path_stat.nlink == 1 &&
+               descriptor_stat.dev == path_stat.dev && descriptor_stat.ino == path_stat.ino
+          raise TransactionFailure, "unsafe overlay transaction owner lock: #{@owner_lock_path}"
+        end
       end
 
       sig { params(directory: Pathname).void }
@@ -411,16 +444,19 @@ module Homebrew
 
       sig { void }
       def cleanup_paths!
-        FileUtils.rm_rf(@staging_root) if @staging_root.exist?
+        prepare_control_directories!
+        owner_lock_present = @owner_lock_path.exist? || @owner_lock_path.symlink?
+        validate_owner_lock_path! if owner_lock_present
+        FileUtils.rm_rf(@staging_root) if @staging_root.exist? || @staging_root.symlink?
         FileUtils.rm_rf(@replacement_root) if @replacement_root.exist? || @replacement_root.symlink?
         if @pending_transaction_dir.exist? || @pending_transaction_dir.symlink?
           FileUtils.rm_rf(@pending_transaction_dir)
         end
         FileUtils.rm_rf(transaction_dir) if transaction_dir.exist? || transaction_dir.symlink?
-        @owner_lock_path.unlink if @owner_lock_path.file? && !@owner_lock_path.symlink?
-        @owner_lock_path.parent.rmdir_if_possible
-        @staging_root.parent.rmdir_if_possible
-        @replacement_root.parent.rmdir_if_possible
+        if owner_lock_present
+          validate_owner_lock_path!
+          @owner_lock_path.unlink
+        end
       ensure
         release_owner_lock!
       end

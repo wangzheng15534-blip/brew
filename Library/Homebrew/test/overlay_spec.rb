@@ -88,6 +88,36 @@ RSpec.describe Homebrew::Overlay do
     transaction&.rollback!
   end
 
+  it "rejects symlinked formula transaction control directories" do
+    add_base_formula("foo", "1.0")
+    outside = root/"outside-staging"
+    outside.mkpath
+    FileUtils.ln_s(outside, user_cellar/".homebrew-overlay-staging")
+
+    expect do
+      described_class.begin_formula_transaction(formula, base_generation:)
+    end.to raise_error(Homebrew::Overlay::TransactionFailure, /unsafe overlay directory component/)
+    expect(outside.children).to be_empty
+  end
+
+  it "rejects hard-linked transaction owner locks before cleanup" do
+    add_base_formula("foo", "1.0")
+    transaction = T.must(described_class.begin_formula_transaction(formula, base_generation:))
+    owner_lock = prefix/"var/homebrew/overlay/transactions/.locks/#{transaction.id}.lock"
+    peer = root/"owner-lock-peer"
+    FileUtils.ln(owner_lock, peer)
+
+    expect do
+      transaction.rollback!
+    end.to raise_error(Homebrew::Overlay::TransactionFailure, /unsafe overlay transaction owner lock/)
+    expect(peer).to have_file_content("")
+    expect(transaction.transaction_dir).to be_a_directory
+
+    peer.unlink
+    transaction.rollback!
+    expect(transaction.finished?).to be(true)
+  end
+
   it "atomically publishes a native version-union rack and commits it" do
     base_keg = add_base_formula("foo", "1.0")
     transaction = T.must(described_class.begin_formula_transaction(formula, base_generation:))
@@ -113,6 +143,25 @@ RSpec.describe Homebrew::Overlay do
     expect(transaction.transaction_dir).not_to exist
     expect(transaction.replacement_rack).not_to exist
     expect(described_class).to have_received(:sync!)
+  end
+
+  it "does not accept a hard-linked transaction marker" do
+    add_base_formula("foo", "1.0")
+    transaction = T.must(described_class.begin_formula_transaction(formula, base_generation:))
+    stage(transaction)
+    transaction.publish!
+    marker = transaction.final_version/".brew-overlay-transaction"
+    peer = root/"transaction-marker-peer"
+    FileUtils.ln(marker, peer)
+
+    expect do
+      transaction.commit!
+    end.to raise_error(Homebrew::Overlay::TransactionFailure, /transaction was not published/)
+    expect(peer).to have_file_content("#{transaction.id}\n")
+
+    peer.unlink
+    transaction.rollback!
+    expect(transaction.finished?).to be(true)
   end
 
   it "atomically restores the original inherited rack on rollback" do
