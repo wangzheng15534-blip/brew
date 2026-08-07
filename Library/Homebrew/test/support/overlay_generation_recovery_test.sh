@@ -98,7 +98,10 @@ ready="${case_live}/owner-ready"
   homebrew-overlay-mark-generation-dirty "${case_live}/user"
   mkdir -p "${case_live}/user/Cellar/live-local/1.0"
   : >"${ready}"
-  sleep 120
+  while :
+  do
+    sleep 0.1
+  done
 ) 8<>"${mutation_lock}" &
 owner_pid=$!
 for _ in {1..200}
@@ -163,7 +166,10 @@ ready="${case_base_live}/owner-ready"
   homebrew-overlay-mark-generation-dirty "${case_base_live}/base"
   mkdir -p "${case_base_live}/base/Cellar/transient-base/3.0"
   : >"${ready}"
-  sleep 120
+  while :
+  do
+    sleep 0.1
+  done
 ) 8<>"${base_lock}" &
 owner_pid=$!
 for _ in {1..200}

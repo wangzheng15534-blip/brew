@@ -246,6 +246,21 @@ RSpec.describe Homebrew::Overlay do
     expect(outside/"homebrew/locks/overlay-mutation.lock").not_to exist
   end
 
+  it "rejects a hard-linked mutation lock without modifying its peer" do
+    lock_path = prefix/"var/homebrew/locks/overlay-mutation.lock"
+    lock_path.dirname.mkpath
+    victim = root/"lock-victim"
+    victim.write("unchanged\n")
+    victim.chmod 0600
+    FileUtils.ln(victim, lock_path)
+
+    expect do
+      described_class.begin_mutation!
+    end.to raise_error(Homebrew::Overlay::TransactionFailure, /unsafe overlay mutation lock/)
+    expect(victim.read).to eq("unchanged\n")
+    expect(victim.stat.mode & 0777).to eq(0600)
+  end
+
   it "marks the prefix dirty before advancing its generation" do
     script = HOMEBREW_LIBRARY_PATH/"utils/overlay.sh"
     owner_matcher = a_string_matching(/\A[0-9]+-[0-9]+-[0-9a-f]{32}\z/)

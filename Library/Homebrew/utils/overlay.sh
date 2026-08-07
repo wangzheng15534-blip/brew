@@ -81,6 +81,38 @@ homebrew-overlay-mutation-owner-valid() {
   [[ "$1" =~ ^[A-Za-z0-9._-]{16,128}$ ]]
 }
 
+homebrew-overlay-lock-path-valid() {
+  local lock_file="$1"
+  local expected_owner="$2"
+  local owner links file_type
+
+  [[ -f "${lock_file}" && ! -L "${lock_file}" && -r "${lock_file}" ]] || return 1
+  owner="$(stat -Lc '%u' -- "${lock_file}")" || return 1
+  links="$(stat -Lc '%h' -- "${lock_file}")" || return 1
+  file_type="$(stat -Lc '%F' -- "${lock_file}")" || return 1
+  [[ "${owner}" == "${expected_owner}" && "${links}" == 1 && "${file_type}" == regular*file ]]
+}
+
+homebrew-overlay-lock-fd-valid() {
+  local lock_fd="$1"
+  local lock_file="$2"
+  local expected_owner="$3"
+  local fd_path="/proc/self/fd/${lock_fd}"
+  local fd_identity path_identity fd_owner fd_links fd_type
+
+  homebrew-overlay-lock-path-valid "${lock_file}" "${expected_owner}" || return 1
+  [[ -e "${fd_path}" ]] || return 1
+  fd_identity="$(stat -Lc '%d:%i' -- "${fd_path}")" || return 1
+  path_identity="$(stat -Lc '%d:%i' -- "${lock_file}")" || return 1
+  fd_owner="$(stat -Lc '%u' -- "${fd_path}")" || return 1
+  fd_links="$(stat -Lc '%h' -- "${fd_path}")" || return 1
+  fd_type="$(stat -Lc '%F' -- "${fd_path}")" || return 1
+  [[ "${fd_identity}" == "${path_identity}" &&
+     "${fd_owner}" == "${expected_owner}" && "${fd_links}" == 1 &&
+     "${fd_type}" == regular*file ]] || return 1
+  homebrew-overlay-lock-path-valid "${lock_file}" "${expected_owner}"
+}
+
 homebrew-overlay-prepare-mutation-lock() {
   local prefix="$1"
   local lock_file owner
@@ -93,27 +125,65 @@ homebrew-overlay-prepare-mutation-lock() {
   then
     (umask 027; set -o noclobber; : >"${lock_file}") 2>/dev/null || true
   fi
-  [[ -f "${lock_file}" && ! -L "${lock_file}" ]] || {
+  owner="$(id -u)"
+  homebrew-overlay-lock-path-valid "${lock_file}" "${owner}" || {
     echo "Error: unsafe Homebrew overlay mutation lock: ${lock_file}" >&2
-    return 1
-  }
-  owner="$(stat -c '%u' -- "${lock_file}")" || return 1
-  [[ "${owner}" == "$(id -u)" ]] || {
-    echo "Error: Homebrew overlay mutation lock is not owned by uid $(id -u): ${lock_file}" >&2
     return 1
   }
   chmod 0640 "${lock_file}" || return 1
   printf '%s\n' "${lock_file}"
 }
 
+homebrew-overlay-prepare-sync-lock() {
+  local prefix="$1"
+  local lock_file owner
+
+  prefix="$(homebrew-overlay-normalize-absolute "${prefix}")" || return 1
+  homebrew-overlay-prefix-owned-and-writable "${prefix}" || return 1
+  lock_file="${prefix}/var/homebrew/locks/overlay-sync.lock"
+  homebrew-overlay-safe-mkdir "${prefix}" "${lock_file%/*}" || return 1
+  if [[ ! -e "${lock_file}" && ! -L "${lock_file}" ]]
+  then
+    (umask 027; set -o noclobber; : >"${lock_file}") 2>/dev/null || true
+  fi
+  owner="$(id -u)"
+  homebrew-overlay-lock-path-valid "${lock_file}" "${owner}" || {
+    echo "Error: unsafe Homebrew overlay synchronization lock: ${lock_file}" >&2
+    return 1
+  }
+  chmod 0640 "${lock_file}" || return 1
+  printf '%s\n' "${lock_file}"
+}
+
+homebrew-overlay-existing-base-mutation-lock() {
+  local base_prefix="$1"
+  local lock_file base_owner
+
+  base_prefix="$(homebrew-overlay-normalize-absolute "${base_prefix}")" || return 1
+  [[ -d "${base_prefix}" && ! -L "${base_prefix}" ]] || return 1
+  base_owner="$(stat -Lc '%u' -- "${base_prefix}")" || return 1
+  lock_file="$(homebrew-overlay-mutation-lock-file "${base_prefix}")" || return 1
+  homebrew-overlay-lock-path-valid "${lock_file}" "${base_owner}" || {
+    echo "Error: the administrator Homebrew mutation lock is unavailable or unsafe: ${lock_file}" >&2
+    echo "Ask an administrator to run this Homebrew build once before using the overlay." >&2
+    return 1
+  }
+  printf '%s\n' "${lock_file}"
+}
+
 homebrew-overlay-mutation-active() {
   local prefix="$1"
-  local lock_file lock_fd
+  local lock_file lock_fd owner
 
   lock_file="$(homebrew-overlay-mutation-lock-file "${prefix}")" || return 2
   [[ -e "${lock_file}" || -L "${lock_file}" ]] || return 1
-  [[ -f "${lock_file}" && ! -L "${lock_file}" && -r "${lock_file}" ]] || return 2
+  owner="$(stat -Lc '%u' -- "${prefix}")" || return 2
+  homebrew-overlay-lock-path-valid "${lock_file}" "${owner}" || return 2
   exec {lock_fd}<"${lock_file}" || return 2
+  homebrew-overlay-lock-fd-valid "${lock_fd}" "${lock_file}" "${owner}" || {
+    exec {lock_fd}>&-
+    return 2
+  }
   if flock -x -n "${lock_fd}"
   then
     flock -u "${lock_fd}" || true
@@ -231,6 +301,10 @@ homebrew-overlay-ensure-generation() {
   local generation_file generation
 
   prefix="$(homebrew-overlay-normalize-absolute "${prefix}")" || return 1
+  if homebrew-overlay-prefix-owned-and-writable "${prefix}"
+  then
+    homebrew-overlay-prepare-mutation-lock "${prefix}" >/dev/null || return 1
+  fi
   generation_file="$(homebrew-overlay-generation-file "${prefix}")" || return 1
   if [[ -e "${generation_file}" || -L "${generation_file}" ]]
   then
@@ -761,6 +835,29 @@ homebrew-overlay-view-key() {
   fi
 }
 
+homebrew-overlay-base-generation() {
+  local configured_base base_prefix base_lock base_owner
+
+  configured_base="${HOMEBREW_OVERLAY_BASE_PREFIX:-}"
+  base_prefix="$(homebrew-overlay-normalize-absolute \
+    "$(homebrew-overlay-expand-home "${configured_base}")")" || return 1
+  [[ -d "${base_prefix}/Cellar" && ! -L "${base_prefix}/Cellar" ]] || return 1
+  base_lock="$(homebrew-overlay-existing-base-mutation-lock "${base_prefix}")" || return 1
+  base_owner="$(stat -Lc '%u' -- "${base_prefix}")" || return 1
+
+  (
+    homebrew-overlay-lock-fd-valid 7 "${base_lock}" "${base_owner}" || {
+      echo "Error: unsafe administrator Homebrew mutation lock descriptor" >&2
+      exit 1
+    }
+    flock -s -n 7 || {
+      echo "Error: the administrator Homebrew prefix is being mutated; retry after it finishes" >&2
+      exit 1
+    }
+    homebrew-overlay-view-key "${base_prefix}"
+  ) 7<"${base_lock}"
+}
+
 homebrew-overlay-update-base-drift() {
   local prefix="$1"
   local base_key="$2"
@@ -1247,17 +1344,6 @@ homebrew-overlay-sync-unlocked() {
   if [[ -e "${base_dirty_file}" || -L "${base_dirty_file}" ]]
   then
     homebrew-overlay-read-generation-dirty "${base_prefix}" >/dev/null || return 1
-    if homebrew-overlay-mutation-active "${base_prefix}"
-    then
-      echo "Error: the administrator Homebrew prefix is being mutated; retry after it finishes" >&2
-      return 1
-    else
-      mutation_status=$?
-      [[ "${mutation_status}" -eq 1 ]] || {
-        echo "Error: could not validate the administrator Homebrew mutation lock" >&2
-        return 1
-      }
-    fi
     force=1
   fi
   if [[ -e "${local_dirty_file}" || -L "${local_dirty_file}" ]]
@@ -1333,11 +1419,16 @@ homebrew-overlay-sync-unlocked() {
 
 homebrew-overlay-sync() {
   local force=0
-  local lock_file mutation_lock owner="${HOMEBREW_OVERLAY_MUTATION_OWNER:-}"
+  local lock_file mutation_lock base_lock base_prefix base_owner
+  local owner="${HOMEBREW_OVERLAY_MUTATION_OWNER:-}"
   [[ "${1:-}" == "--force" ]] && force=1
-  lock_file="${HOMEBREW_PREFIX}/var/homebrew/locks/overlay-sync.lock"
-  homebrew-overlay-safe-mkdir "${HOMEBREW_PREFIX}" "${lock_file%/*}" || return 1
+  base_prefix="$(homebrew-overlay-normalize-absolute \
+    "$(homebrew-overlay-expand-home "${HOMEBREW_OVERLAY_BASE_PREFIX:-}")")" || return 1
+  [[ "${base_prefix}" != "${HOMEBREW_PREFIX}" ]] || return 1
+  lock_file="$(homebrew-overlay-prepare-sync-lock "${HOMEBREW_PREFIX}")" || return 1
   mutation_lock="$(homebrew-overlay-prepare-mutation-lock "${HOMEBREW_PREFIX}")" || return 1
+  base_lock="$(homebrew-overlay-existing-base-mutation-lock "${base_prefix}")" || return 1
+  base_owner="$(stat -Lc '%u' -- "${base_prefix}")" || return 1
 
   command -v flock >/dev/null 2>&1 || {
     echo "Error: active Homebrew overlays require flock from util-linux" >&2
@@ -1345,7 +1436,23 @@ homebrew-overlay-sync() {
   }
   (
     local recorded_owner=""
+    homebrew-overlay-lock-fd-valid 7 "${base_lock}" "${base_owner}" || {
+      echo "Error: unsafe administrator Homebrew mutation lock descriptor" >&2
+      exit 1
+    }
+    homebrew-overlay-lock-fd-valid 8 "${mutation_lock}" "$(id -u)" || {
+      echo "Error: unsafe Homebrew overlay mutation lock descriptor" >&2
+      exit 1
+    }
+    homebrew-overlay-lock-fd-valid 9 "${lock_file}" "$(id -u)" || {
+      echo "Error: unsafe Homebrew overlay synchronization lock descriptor" >&2
+      exit 1
+    }
     flock -x 9 || exit 1
+    flock -s -n 7 || {
+      echo "Error: the administrator Homebrew prefix is being mutated; retry after it finishes" >&2
+      exit 1
+    }
     if [[ -n "${owner}" ]]
     then
       homebrew-overlay-mutation-owner-valid "${owner}" || {
@@ -1358,7 +1465,7 @@ homebrew-overlay-sync() {
         echo "Error: Homebrew overlay mutation owner is not backed by an active lock" >&2
         exit 1
       fi
-      IFS= read -r recorded_owner <"${mutation_lock}" || true
+      IFS= read -r -u 8 recorded_owner || true
       [[ "${recorded_owner}" == "${owner}" ]] || {
         echo "Error: Homebrew overlay mutation owner does not match the active lock" >&2
         exit 1
@@ -1370,7 +1477,7 @@ homebrew-overlay-sync() {
       }
     fi
     homebrew-overlay-sync-unlocked "${force}"
-  ) 8<>"${mutation_lock}" 9>"${lock_file}"
+  ) 7<"${base_lock}" 8<>"${mutation_lock}" 9<>"${lock_file}"
 }
 
 homebrew-overlay-bootstrap() {
@@ -1429,9 +1536,7 @@ then
       homebrew-overlay-sync
       ;;
     --base-generation)
-      base_prefix="$(homebrew-overlay-normalize-absolute         "$(homebrew-overlay-expand-home "${HOMEBREW_OVERLAY_BASE_PREFIX:-}")")" || exit 1
-      [[ -d "${base_prefix}/Cellar" && ! -L "${base_prefix}/Cellar" ]] || exit 1
-      homebrew-overlay-view-key "${base_prefix}"
+      homebrew-overlay-base-generation
       ;;
     --ensure-generation)
       prefix="$(homebrew-overlay-normalize-absolute "${2:-${HOMEBREW_PREFIX:-}}")" || exit 1

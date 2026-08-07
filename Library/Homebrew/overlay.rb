@@ -909,9 +909,10 @@ module Homebrew
 
       flags = File::RDWR | File::CREAT | File::NOFOLLOW
       lock = File.open(lock_path, flags, 0640)
-      unless lock.stat.uid == Process.uid
+      lock_stat = lock.stat
+      unless lock_stat.file? && lock_stat.uid == Process.uid && lock_stat.nlink == 1
         lock.close
-        raise TransactionFailure, "overlay mutation lock is not owned by uid #{Process.uid}: #{lock_path}"
+        raise TransactionFailure, "unsafe overlay mutation lock: #{lock_path}"
       end
       lock.chmod 0640
       lock.close_on_exec = true
