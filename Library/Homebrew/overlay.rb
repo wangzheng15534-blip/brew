@@ -56,6 +56,8 @@ module Homebrew
     RENAME_EXCHANGE = 2
     MUTATION_LOCK_DESCRIPTOR = 198
     TRANSACTION_LOCK_DESCRIPTOR = 199
+    MAX_TRANSACTION_MARKER_BYTES = 256
+    MAX_MANAGED_STATE_BYTES = 64 * 1024 * 1024
     RENAMEAT2_SYSCALLS = T.let(
       {
         "x86_64"  => 316,
@@ -236,10 +238,12 @@ module Homebrew
       sig { params(path: Pathname).returns(T::Boolean) }
       def marker_owned?(path)
         marker = path/TRANSACTION_MARKER
-        return false unless marker.file? && !marker.symlink?
-
-        stat = marker.lstat
-        stat.uid == Process.uid && stat.nlink == 1 && marker.binread == "#{id}\n"
+        contents = Overlay.read_owned_file(
+          marker,
+          description: "overlay formula transaction marker",
+          max_bytes:   MAX_TRANSACTION_MARKER_BYTES,
+        )
+        contents == "#{id}\n"
       end
 
       sig { returns(T::Boolean) }
@@ -508,6 +512,72 @@ module Homebrew
     sig { params(version: String).returns(T::Boolean) }
     def self.valid_version_name?(version)
       !version.empty? && version != "." && version != ".." && version.match?(/\A[^\/\0\r\n]+\z/)
+    end
+
+    sig {
+      params(
+        path: Pathname,
+        description: String,
+        max_bytes: Integer,
+      ).returns(T.nilable(String))
+    }
+    def self.read_owned_file(path, description:, max_bytes:)
+      flags = File::RDONLY | File::NOFOLLOW
+      file = begin
+        File.open(path, flags)
+      rescue Errno::ENOENT
+        return nil
+      rescue SystemCallError, IOError => e
+        raise TransactionFailure, "unsafe #{description}: #{path} (#{e.message})"
+      end
+
+      begin
+        file.binmode
+        descriptor_stat = file.stat
+        path_stat = path.lstat
+        safe_descriptor = descriptor_stat.file? &&
+                          descriptor_stat.uid == Process.uid &&
+                          descriptor_stat.nlink == 1 &&
+                          (descriptor_stat.mode & 0022).zero? &&
+                          descriptor_stat.dev == path_stat.dev &&
+                          descriptor_stat.ino == path_stat.ino
+        unless safe_descriptor
+          raise TransactionFailure, "unsafe #{description}: #{path}"
+        end
+        if descriptor_stat.size > max_bytes
+          raise TransactionFailure, "oversized #{description}: #{path}"
+        end
+
+        contents = file.read(max_bytes + 1) || ""
+        final_descriptor_stat = file.stat
+        final_path_stat = path.lstat
+        stable_descriptor = descriptor_stat.dev == final_descriptor_stat.dev &&
+                            descriptor_stat.ino == final_descriptor_stat.ino &&
+                            descriptor_stat.mode == final_descriptor_stat.mode &&
+                            descriptor_stat.uid == final_descriptor_stat.uid &&
+                            descriptor_stat.gid == final_descriptor_stat.gid &&
+                            descriptor_stat.nlink == final_descriptor_stat.nlink &&
+                            descriptor_stat.size == final_descriptor_stat.size &&
+                            descriptor_stat.mtime == final_descriptor_stat.mtime &&
+                            descriptor_stat.ctime == final_descriptor_stat.ctime
+        stable_path = final_descriptor_stat.dev == final_path_stat.dev &&
+                      final_descriptor_stat.ino == final_path_stat.ino &&
+                      final_descriptor_stat.mode == final_path_stat.mode &&
+                      final_descriptor_stat.uid == final_path_stat.uid &&
+                      final_descriptor_stat.nlink == final_path_stat.nlink
+        unless stable_descriptor && stable_path && contents.bytesize == descriptor_stat.size &&
+               contents.bytesize <= max_bytes
+          raise TransactionFailure, "changed #{description} while reading: #{path}"
+        end
+
+        contents
+      rescue TransactionFailure
+        raise
+      rescue SystemCallError, IOError => e
+        raise TransactionFailure, "unsafe #{description}: #{path} (#{e.message})"
+      ensure
+        file.close unless file.closed?
+      end
     end
 
     sig { params(path: Pathname).returns(Pathname) }
@@ -916,42 +986,36 @@ module Homebrew
 
     sig { returns(T::Hash[String, String]) }
     def self.link_state_entries
-      @link_state_entries ||= T.let(
-        if link_state_file.exist? || link_state_file.symlink?
-          state = link_state_file
-          unless state.file? && !state.symlink? && state.readable? && state.stat.uid == Process.uid && state.stat.nlink == 1
-            raise TransactionFailure, "unsafe overlay view state: #{state}"
-          end
+      cached_entries = @link_state_entries
+      return cached_entries if cached_entries
 
-          contents = state.binread
-          if contents.empty?
-            {}
-          else
-            unless contents.end_with?("\0")
-              raise TransactionFailure, "invalid overlay view state: #{state}"
-            end
-
-            fields = contents.split("\0", -1)
-            fields.pop
-            unless fields.length.even? && fields.none?(&:empty?)
-              raise TransactionFailure, "invalid overlay view state: #{state}"
-            end
-
-            entries = T.let({}, T::Hash[String, String])
-            fields.each_slice(2) do |relative, target|
-              expected = expected_link_target(relative)
-              if expected.nil? || target != expected || entries.key?(relative)
-                raise TransactionFailure, "invalid overlay view state: #{state}"
-              end
-              entries[relative] = target
-            end
-            entries
-          end
-        else
-          {}
-        end,
-        T::Hash[String, String],
+      state = link_state_file
+      contents = read_owned_file(
+        state,
+        description: "overlay view state",
+        max_bytes:   MAX_MANAGED_STATE_BYTES,
       )
+      entries = T.let({}, T::Hash[String, String])
+      unless contents.nil? || contents.empty?
+        unless contents.end_with?("\0")
+          raise TransactionFailure, "invalid overlay view state: #{state}"
+        end
+
+        fields = contents.split("\0", -1)
+        fields.pop
+        unless fields.length.even? && fields.none?(&:empty?)
+          raise TransactionFailure, "invalid overlay view state: #{state}"
+        end
+
+        fields.each_slice(2) do |relative, target|
+          expected = expected_link_target(relative)
+          if expected.nil? || target != expected || entries.key?(relative)
+            raise TransactionFailure, "invalid overlay view state: #{state}"
+          end
+          entries[relative] = target
+        end
+      end
+      @link_state_entries = entries
     end
     private_class_method :link_state_entries
 

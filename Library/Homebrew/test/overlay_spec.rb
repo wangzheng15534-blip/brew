@@ -156,12 +156,40 @@ RSpec.describe Homebrew::Overlay do
 
     expect do
       transaction.commit!
-    end.to raise_error(Homebrew::Overlay::TransactionFailure, /transaction was not published/)
+    end.to raise_error(Homebrew::Overlay::TransactionFailure, /unsafe overlay formula transaction marker/)
     expect(peer).to have_file_content("#{transaction.id}\n")
 
     peer.unlink
     transaction.rollback!
     expect(transaction.finished?).to be(true)
+  end
+
+  it "rejects a transaction marker path replaced after opening" do
+    add_base_formula("foo", "1.0")
+    transaction = T.must(described_class.begin_formula_transaction(formula, base_generation:))
+    stage(transaction)
+    transaction.publish!
+    marker = transaction.final_version/".brew-overlay-transaction"
+    opened_marker = root/"opened-transaction-marker"
+    replacement = root/"replacement-transaction-marker"
+    replacement.write("#{transaction.id}\n")
+    replacement.chmod 0600
+    flags = File::RDONLY | File::NOFOLLOW
+
+    expect(File).to receive(:open).with(marker, flags).and_wrap_original do |original, *arguments|
+      file = original.call(*arguments)
+      marker.rename(opened_marker)
+      replacement.rename(marker)
+      file
+    end
+
+    expect do
+      transaction.commit!
+    end.to raise_error(Homebrew::Overlay::TransactionFailure, /unsafe overlay formula transaction marker/)
+  ensure
+    marker&.unlink if marker&.exist? || marker&.symlink?
+    opened_marker&.rename(marker) if opened_marker&.exist?
+    transaction&.rollback! unless transaction&.finished?
   end
 
   it "atomically restores the original inherited rack on rollback" do
@@ -282,6 +310,35 @@ RSpec.describe Homebrew::Overlay do
 
     expect(described_class.remove_inherited_prefix_link!(link)).to be(true)
     expect(link).not_to be_a_symlink
+  end
+
+  it "rejects managed link state replaced after opening" do
+    target = (base_prefix/"opt/foo").to_s
+    link = prefix/"opt/foo"
+    link.dirname.mkpath
+    FileUtils.ln_s(target, link)
+    state_file = prefix/"var/homebrew/overlay/view.state"
+    state_file.dirname.mkpath
+    state_file.binwrite("opt/foo\0#{target}\0")
+    opened_state = root/"opened-view-state"
+    replacement = root/"replacement-view-state"
+    replacement.binwrite("opt/foo\0#{target}\0")
+    flags = File::RDONLY | File::NOFOLLOW
+
+    expect(File).to receive(:open).with(state_file, flags).and_wrap_original do |original, *arguments|
+      file = original.call(*arguments)
+      state_file.rename(opened_state)
+      replacement.rename(state_file)
+      file
+    end
+
+    expect do
+      described_class.remove_inherited_prefix_link!(link)
+    end.to raise_error(Homebrew::Overlay::TransactionFailure, /unsafe overlay view state/)
+    expect(link).to be_a_symlink
+  ensure
+    state_file&.unlink if state_file&.exist? || state_file&.symlink?
+    opened_state&.rename(state_file) if opened_state&.exist?
   end
 
   it "rejects malformed or non-base managed link state" do
