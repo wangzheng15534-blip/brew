@@ -162,4 +162,32 @@ fi
 grep -q 'invalid overlay view state' "${case_state}/hardlink.err"
 grep -qx 'unchanged-state' "${victim}"
 
+# The fast path must hash and parse one descriptor-bound state snapshot. A
+# replacement between separate validation and use opens would otherwise allow
+# the stamp digest to authenticate one file while link checks consume another.
+case_snapshot="${work}/snapshot-binding"
+make_case "${case_snapshot}"
+activate "${case_snapshot}"
+homebrew-overlay-sync --force
+snapshot_state="${case_snapshot}/user/var/homebrew/overlay/view.state"
+snapshot_digest="$(homebrew-overlay-state-digest "${snapshot_state}")"
+snapshot_replacement="${case_snapshot}/replacement.state"
+: >"${snapshot_replacement}"
+chmod 0600 "${snapshot_replacement}"
+state_links_definition="$(declare -f homebrew-overlay-state-links-match)"
+eval "$(printf '%s\n' "${state_links_definition}" |
+  sed '1s/homebrew-overlay-state-links-match/homebrew-overlay-original-state-links-match/')"
+homebrew-overlay-state-links-match() {
+  mv -fT -- "${snapshot_replacement}" "$3"
+  homebrew-overlay-original-state-links-match "$@"
+}
+if homebrew-overlay-fast-view-current \
+  "${case_snapshot}/user" "${case_snapshot}/base" "${snapshot_state}" "${snapshot_digest}"
+then
+  echo 'replacement between state digest and parsing unexpectedly passed the fast path' >&2
+  exit 1
+fi
+eval "${state_links_definition}"
+unset -f homebrew-overlay-original-state-links-match
+
 printf 'overlay synchronization integrity test: PASS\n'

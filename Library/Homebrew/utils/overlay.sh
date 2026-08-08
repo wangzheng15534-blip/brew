@@ -254,6 +254,14 @@ homebrew-overlay-read-line() {
     exec {file_fd}>&-
     return 1
   }
+  byte_count="$(stat -Lc '%s' -- "/proc/self/fd/${file_fd}")" || {
+    exec {file_fd}>&-
+    return 1
+  }
+  [[ "${byte_count}" -le "${max_bytes}" ]] || {
+    exec {file_fd}>&-
+    return 1
+  }
   IFS= read -r -u "${file_fd}" value || {
     exec {file_fd}>&-
     return 1
@@ -285,6 +293,62 @@ homebrew-overlay-read-line() {
   }
   exec {file_fd}>&-
   printf '%s\n' "${value}"
+}
+
+homebrew-overlay-read-lines() {
+  local file="$1"
+  local expected_owner="$2"
+  local max_bytes="$3"
+  local array_name="$4"
+  local file_fd byte_count expected_bytes=0 initial_metadata final_metadata value
+  local -n output_lines="${array_name}"
+  local LC_ALL=C
+
+  output_lines=()
+  [[ "${max_bytes}" =~ ^[0-9]+$ && "${max_bytes}" -gt 0 ]] || return 1
+  [[ -f "${file}" && ! -L "${file}" && -r "${file}" ]] || return 1
+  exec {file_fd}<"${file}" || return 1
+  homebrew-overlay-lock-fd-valid "${file_fd}" "${file}" "${expected_owner}" || {
+    exec {file_fd}>&-
+    return 1
+  }
+  initial_metadata="$(stat -Lc '%u %h %f %d %i %s %y %z' -- "/proc/self/fd/${file_fd}")" || {
+    exec {file_fd}>&-
+    return 1
+  }
+  byte_count="$(stat -Lc '%s' -- "/proc/self/fd/${file_fd}")" || {
+    exec {file_fd}>&-
+    return 1
+  }
+  [[ "${byte_count}" -le "${max_bytes}" ]] || {
+    exec {file_fd}>&-
+    return 1
+  }
+  mapfile -t -u "${file_fd}" output_lines || {
+    exec {file_fd}>&-
+    return 1
+  }
+  for value in "${output_lines[@]}"
+  do
+    expected_bytes=$((expected_bytes + ${#value} + 1))
+  done
+  [[ "${byte_count}" -eq "${expected_bytes}" ]] || {
+    exec {file_fd}>&-
+    return 1
+  }
+  final_metadata="$(stat -Lc '%u %h %f %d %i %s %y %z' -- "/proc/self/fd/${file_fd}")" || {
+    exec {file_fd}>&-
+    return 1
+  }
+  homebrew-overlay-lock-fd-valid "${file_fd}" "${file}" "${expected_owner}" || {
+    exec {file_fd}>&-
+    return 1
+  }
+  [[ "${initial_metadata}" == "${final_metadata}" ]] || {
+    exec {file_fd}>&-
+    return 1
+  }
+  exec {file_fd}>&-
 }
 
 homebrew-overlay-read-digest() {
@@ -843,9 +907,15 @@ homebrew-overlay-load-state() {
   local file="$1"
   local array_name="$2"
   local base_prefix="$3"
-  local file_fd relative target initial_metadata final_metadata
+  local digest_name="${4:-}"
+  local file_fd digest_fd relative target digest="" initial_metadata final_metadata digest_metadata
   local -n output_map="${array_name}"
   output_map=()
+  if [[ -n "${digest_name}" ]]
+  then
+    local -n output_digest="${digest_name}"
+    output_digest=""
+  fi
   [[ -e "${file}" || -L "${file}" ]] || return 0
   [[ -f "${file}" && ! -L "${file}" && -O "${file}" && -r "${file}" ]] || return 1
   exec {file_fd}<"${file}" || return 1
@@ -895,6 +965,55 @@ homebrew-overlay-load-state() {
     exec {file_fd}>&-
     return 1
   }
+  if [[ -n "${digest_name}" ]]
+  then
+    exec {digest_fd}<"/proc/self/fd/${file_fd}" || {
+      exec {file_fd}>&-
+      return 1
+    }
+    homebrew-overlay-lock-fd-valid "${digest_fd}" "${file}" "${EUID}" || {
+      exec {digest_fd}>&-
+      exec {file_fd}>&-
+      return 1
+    }
+    digest_metadata="$(stat -Lc '%u %h %f %d %i %s %y %z' -- "/proc/self/fd/${digest_fd}")" || {
+      exec {digest_fd}>&-
+      exec {file_fd}>&-
+      return 1
+    }
+    [[ "${digest_metadata}" == "${initial_metadata}" ]] || {
+      exec {digest_fd}>&-
+      exec {file_fd}>&-
+      return 1
+    }
+    digest="$(sha256sum <&"${digest_fd}" | awk '{print $1}')" || {
+      exec {digest_fd}>&-
+      exec {file_fd}>&-
+      return 1
+    }
+    homebrew-overlay-base-generation-valid "${digest}" || {
+      exec {digest_fd}>&-
+      exec {file_fd}>&-
+      return 1
+    }
+    final_metadata="$(stat -Lc '%u %h %f %d %i %s %y %z' -- "/proc/self/fd/${digest_fd}")" || {
+      exec {digest_fd}>&-
+      exec {file_fd}>&-
+      return 1
+    }
+    homebrew-overlay-lock-fd-valid "${digest_fd}" "${file}" "${EUID}" || {
+      exec {digest_fd}>&-
+      exec {file_fd}>&-
+      return 1
+    }
+    [[ "${digest_metadata}" == "${final_metadata}" ]] || {
+      exec {digest_fd}>&-
+      exec {file_fd}>&-
+      return 1
+    }
+    exec {digest_fd}>&-
+    output_digest="${digest}"
+  fi
   exec {file_fd}>&-
 }
 
@@ -902,12 +1021,14 @@ homebrew-overlay-state-links-match() {
   local prefix="$1"
   local base_prefix="$2"
   local state_file="$3"
-  local relative
+  local expected_digest="$4"
+  local relative actual_digest
   local -A state=()
   local -a paths=()
   local -a targets=()
 
-  homebrew-overlay-load-state "${state_file}" state "${base_prefix}" || return 2
+  homebrew-overlay-load-state "${state_file}" state "${base_prefix}" actual_digest || return 2
+  [[ "${actual_digest}" == "${expected_digest}" ]] || return 1
   for relative in "${!state[@]}"
   do
     paths+=("${prefix}/${relative}")
@@ -931,15 +1052,13 @@ homebrew-overlay-fast-view-current() {
   local base_prefix="$2"
   local state_file="$3"
   local expected_digest="$4"
-  local actual_digest status
+  local status
 
   # A missing state file carries no authorization to remove anything, but the
   # exact live links can be reconstructed during a full reconciliation. Other
   # unsafe state objects remain hard errors.
   [[ -e "${state_file}" || -L "${state_file}" ]] || return 1
-  actual_digest="$(homebrew-overlay-state-digest "${state_file}")" || return 2
-  [[ "${actual_digest}" == "${expected_digest}" ]] || return 1
-  if homebrew-overlay-state-links-match "${prefix}" "${base_prefix}" "${state_file}"
+  if homebrew-overlay-state-links-match "${prefix}" "${base_prefix}" "${state_file}" "${expected_digest}"
   then
     status=0
   else
@@ -1546,9 +1665,8 @@ homebrew-overlay-sync-transaction-dir() {
 homebrew-overlay-recover-sync() {
   local prefix="$1"
   local base_prefix="$2"
-  local transaction_dir state desired state_file
+  local transaction_dir state desired state_file state_value
   local state_present=0 desired_present=0
-  local -a state_lines=()
   HOMEBREW_OVERLAY_SYNC_RECOVERED=0
   transaction_dir="$(homebrew-overlay-sync-transaction-dir)"
   state="${transaction_dir}/state"
@@ -1560,13 +1678,11 @@ homebrew-overlay-recover-sync() {
   ((state_present == 1 || desired_present == 1)) || return 0
   if ((state_present == 1))
   then
-    [[ -f "${state}" && ! -L "${state}" && -O "${state}" &&
-       "$(stat -Lc '%h' -- "${state}")" == 1 ]] || {
+    state_value="$(homebrew-overlay-read-line "${state}" "${EUID}" 64)" || {
       echo "Error: unsafe overlay synchronization transaction state: ${state}" >&2
       return 1
     }
-    mapfile -t state_lines <"${state}" || return 1
-    [[ "${#state_lines[@]}" -eq 1 && "${state_lines[0]}" == applying ]] || {
+    [[ "${state_value}" == applying ]] || {
       echo "Error: invalid overlay synchronization transaction state" >&2
       return 1
     }
@@ -2118,12 +2234,10 @@ homebrew-overlay-sync-unlocked() {
   local_key="$(homebrew-overlay-view-key "${prefix}")" || return 1
   if [[ "${force}" -eq 0 && ( -e "${stamp_file}" || -L "${stamp_file}" ) ]]
   then
-    [[ -f "${stamp_file}" && ! -L "${stamp_file}" && -O "${stamp_file}" && -r "${stamp_file}" &&
-       "$(stat -Lc '%h' -- "${stamp_file}")" == 1 ]] || {
+    homebrew-overlay-read-lines "${stamp_file}" "${EUID}" 1024 stamp_lines || {
       echo "Error: unsafe overlay view stamp: ${stamp_file}" >&2
       return 1
     }
-    mapfile -t stamp_lines <"${stamp_file}" || return 1
     if ((${#stamp_lines[@]} == 3))
     then
       old_base="${stamp_lines[0]}"
