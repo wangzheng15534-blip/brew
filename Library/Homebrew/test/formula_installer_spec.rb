@@ -102,6 +102,48 @@ RSpec.describe FormulaInstaller do
     end.to raise_error("stopped after preinstall checks")
   end
 
+  describe "#install" do
+    it "finalizes an owned overlay mutation when no local keg was created" do
+      formula = formula "overlay-no-keg-failure" do
+        T.bind(self, T.class_of(Formula))
+        url "foo-1.0"
+      end
+      installer = described_class.new(formula)
+      generation = "a" * 64
+      mutation_active = false
+
+      allow(installer).to receive_messages(
+        check_conflicts: nil,
+        ignore_deps?:   true,
+        lock:           nil,
+        only_deps?:     false,
+        pour_bottle?:   true,
+        quiet?:         true,
+      )
+      allow(Homebrew::EnvConfig).to receive(:overlay?).and_return(true)
+      allow(Homebrew::Overlay).to receive_messages(
+        active?:                       true,
+        begin_formula_transaction:     nil,
+        current_base_generation:       generation,
+        local_keg_realization?:        false,
+        validate_local_install_target!: nil,
+      )
+      allow(Homebrew::Overlay).to receive(:mutation_active?) { mutation_active }
+      allow(formula).to receive(:deprecated_flags).and_raise("failed before creating a keg")
+
+      expect(Homebrew::Overlay).to receive(:begin_mutation!).ordered do
+        mutation_active = true
+      end
+      expect(Homebrew::Overlay).to receive(:discard_local_keg!).ordered.and_return(false)
+      expect(Homebrew::Overlay).to receive(:sync!).with(mutation: true).ordered do
+        mutation_active = false
+      end
+
+      expect { installer.install }.to raise_error("failed before creating a keg")
+      expect(mutation_active).to be(false)
+    end
+  end
+
   describe "#finish" do
     it "discards an uncommitted local overlay keg when generation validation fails" do
       formula = formula "overlay-generation-race" do

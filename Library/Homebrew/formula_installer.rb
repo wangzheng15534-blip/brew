@@ -154,6 +154,7 @@ class FormulaInstaller
     @overlay_base_generation = T.let(nil, T.nilable(String))
     @overlay_local_keg_preexisting = T.let(false, T::Boolean)
     @overlay_local_keg_committed = T.let(false, T::Boolean)
+    @overlay_mutation_owned = T.let(false, T::Boolean)
     @overlay_previous_failed = T.let(nil, T.nilable(T::Boolean))
 
     # Take the original formula instance, which might have been swapped from an API instance to a source instance
@@ -605,6 +606,7 @@ class FormulaInstaller
     end
     if Homebrew::EnvConfig.overlay? && !Homebrew::Overlay.mutation_active?
       Homebrew::Overlay.begin_mutation!
+      @overlay_mutation_owned = true
     end
     if @overlay_base_generation
       @overlay_previous_failed = Homebrew.failed?
@@ -673,10 +675,14 @@ on_request: installed_on_request?, options:)
     end_time = Time.now
     Homebrew.messages.package_installed(formula.name, end_time - start_time)
   rescue Exception # rubocop:disable Lint/RescueException
-    transaction = @overlay_transaction
-    transaction.rollback! if transaction && !transaction.finished?
-    rollback_overlay_uncommitted_local_keg!
-    restore_overlay_failure_scope!
+    begin
+      transaction = @overlay_transaction
+      transaction.rollback! if transaction && !transaction.finished?
+      rollback_overlay_uncommitted_local_keg!
+    ensure
+      finalize_failed_overlay_mutation!
+      restore_overlay_failure_scope!
+    end
     raise
   end
 
@@ -1061,6 +1067,17 @@ on_request: installed_on_request?, options:)
   end
 
   sig { void }
+  def finalize_failed_overlay_mutation!
+    return unless @overlay_mutation_owned
+
+    begin
+      Homebrew::Overlay.sync!(mutation: true) if Homebrew::Overlay.mutation_active?
+    ensure
+      @overlay_mutation_owned = false
+    end
+  end
+
+  sig { void }
   def restore_overlay_failure_scope!
     previous_failed = @overlay_previous_failed
     return if previous_failed.nil?
@@ -1098,6 +1115,7 @@ on_request: installed_on_request?, options:)
         Homebrew::Overlay.verify_base_generation!(generation)
         @overlay_local_keg_committed = true
         Homebrew::Overlay.bump_generation!
+        @overlay_mutation_owned = false
       end
     end
 
@@ -1184,7 +1202,10 @@ on_request: installed_on_request?, options:)
     end
 
     raise_overlay_transaction_failure!
-    Homebrew::Overlay.bump_generation! unless overlay_managed_install
+    unless overlay_managed_install
+      Homebrew::Overlay.bump_generation!
+      @overlay_mutation_owned = false
+    end
     self.class.installed << formula
 
     caveats
@@ -1192,9 +1213,13 @@ on_request: installed_on_request?, options:)
     ohai "Summary" if verbose? || show_summary_heading?
     puts summary
   rescue Exception # rubocop:disable Lint/RescueException
-    transaction = @overlay_transaction
-    transaction.rollback! if transaction && !transaction.finished?
-    rollback_overlay_uncommitted_local_keg!
+    begin
+      transaction = @overlay_transaction
+      transaction.rollback! if transaction && !transaction.finished?
+      rollback_overlay_uncommitted_local_keg!
+    ensure
+      finalize_failed_overlay_mutation!
+    end
     raise
   ensure
     restore_overlay_failure_scope!
