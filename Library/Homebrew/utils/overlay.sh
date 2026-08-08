@@ -1602,7 +1602,7 @@ homebrew-overlay-read-owned-line() {
 homebrew-overlay-rack-is-exact-inherited-view() {
   local base_rack="$1"
   local local_rack="$2"
-  local base_version local_version version resolved expected
+  local base_version local_version version target
   local base_count=0 local_count=0
   local -a base_entries=(
     "${base_rack}"/*
@@ -1615,9 +1615,8 @@ homebrew-overlay-rack-is-exact-inherited-view() {
   if [[ -L "${local_rack}" ]]
   then
     [[ -e "${local_rack}" ]] || return 1
-    resolved="$(readlink -f -- "${local_rack}")" || return 1
-    expected="$(readlink -f -- "${base_rack}")" || return 1
-    [[ "${resolved}" == "${expected}" ]]
+    target="$(readlink -- "${local_rack}")" || return 1
+    [[ "${target}" == "${base_rack}" ]]
     return
   fi
 
@@ -1631,9 +1630,8 @@ homebrew-overlay-rack-is-exact-inherited-view() {
     [[ "${version}" != */* ]] || return 1
     local_version="${local_rack}/${version}"
     [[ -L "${local_version}" && -e "${local_version}" ]] || return 1
-    resolved="$(readlink -f -- "${local_version}")" || return 1
-    expected="$(readlink -f -- "${base_version}")" || return 1
-    [[ "${resolved}" == "${expected}" ]] || return 1
+    target="$(readlink -- "${local_version}")" || return 1
+    [[ "${target}" == "${base_version}" ]] || return 1
     base_count=$((base_count + 1))
   done
   ((base_count > 0)) || return 1
@@ -1652,9 +1650,8 @@ homebrew-overlay-rack-is-exact-inherited-view() {
     [[ "${version}" != */* ]] || return 1
     base_version="${base_rack}/${version}"
     [[ -d "${base_version}" && ! -L "${base_version}" ]] || return 1
-    resolved="$(readlink -f -- "${local_version}")" || return 1
-    expected="$(readlink -f -- "${base_version}")" || return 1
-    [[ "${resolved}" == "${expected}" ]] || return 1
+    target="$(readlink -- "${local_version}")" || return 1
+    [[ "${target}" == "${base_version}" ]] || return 1
     local_count=$((local_count + 1))
   done
   [[ "${local_count}" -eq "${base_count}" ]]
