@@ -548,6 +548,59 @@ homebrew-overlay-recover-generation() {
   printf '%s\n' "${generation}"
 }
 
+homebrew-overlay-ensure-and-read-generation() {
+  local prefix="$1"
+
+  homebrew-overlay-ensure-generation "${prefix}" || return 1
+  homebrew-overlay-read-generation "${prefix}"
+}
+
+homebrew-overlay-run-generation-command() {
+  local command="$1"
+  local prefix="$2"
+  local mutation_lock inherited_fd
+
+  prefix="$(homebrew-overlay-normalize-absolute "${prefix}")" || return 1
+  mutation_lock="$(homebrew-overlay-prepare-mutation-lock "${prefix}")" || return 1
+  inherited_fd="${HOMEBREW_OVERLAY_MUTATION_LOCK_FD:-}"
+  command -v flock >/dev/null 2>&1 || {
+    echo "Error: overlay generation commands require flock from util-linux" >&2
+    return 1
+  }
+
+  if [[ -n "${inherited_fd}" ]]
+  then
+    homebrew-overlay-inherited-lock-fd-valid \
+      "${inherited_fd}" "${mutation_lock}" "${EUID}" 640 || {
+      echo "Error: unsafe inherited Homebrew overlay mutation lock descriptor" >&2
+      return 1
+    }
+    "${command}" "${prefix}" || return 1
+    homebrew-overlay-inherited-lock-fd-valid \
+      "${inherited_fd}" "${mutation_lock}" "${EUID}" 640 || {
+      echo "Error: inherited Homebrew overlay mutation lock changed during generation update" >&2
+      return 1
+    }
+    return 0
+  fi
+
+  (
+    homebrew-overlay-lock-fd-valid 8 "${mutation_lock}" "${EUID}" || {
+      echo "Error: unsafe Homebrew overlay mutation lock descriptor" >&2
+      exit 1
+    }
+    flock -x -n 8 || {
+      echo "Error: another Homebrew package mutation is still active; retry after it finishes" >&2
+      exit 1
+    }
+    "${command}" "${prefix}" || exit 1
+    homebrew-overlay-lock-fd-valid 8 "${mutation_lock}" "${EUID}" || {
+      echo "Error: Homebrew overlay mutation lock changed during generation update" >&2
+      exit 1
+    }
+  ) 8<>"${mutation_lock}"
+}
+
 homebrew-overlay-write-prefix-config() {
   local prefix="$1"
   local base_prefix="$2"
@@ -2268,20 +2321,19 @@ then
       ;;
     --ensure-generation)
       prefix="$(homebrew-overlay-normalize-absolute "${2:-${HOMEBREW_PREFIX:-}}")" || exit 1
-      homebrew-overlay-ensure-generation "${prefix}"
-      homebrew-overlay-read-generation "${prefix}"
+      homebrew-overlay-run-generation-command homebrew-overlay-ensure-and-read-generation "${prefix}"
       ;;
     --mark-generation-dirty)
       prefix="$(homebrew-overlay-normalize-absolute "${2:-${HOMEBREW_PREFIX:-}}")" || exit 1
-      homebrew-overlay-mark-generation-dirty "${prefix}"
+      homebrew-overlay-run-generation-command homebrew-overlay-mark-generation-dirty "${prefix}"
       ;;
     --recover-generation)
       prefix="$(homebrew-overlay-normalize-absolute "${2:-${HOMEBREW_PREFIX:-}}")" || exit 1
-      homebrew-overlay-recover-generation "${prefix}"
+      homebrew-overlay-run-generation-command homebrew-overlay-recover-generation "${prefix}"
       ;;
     --bump-generation)
       prefix="$(homebrew-overlay-normalize-absolute "${2:-${HOMEBREW_PREFIX:-}}")" || exit 1
-      homebrew-overlay-bump-generation "${prefix}"
+      homebrew-overlay-run-generation-command homebrew-overlay-bump-generation "${prefix}"
       ;;
     *)
       echo "Usage: overlay.sh --sync|--quick-sync|--base-generation|--ensure-generation [prefix]|--mark-generation-dirty [prefix]|--recover-generation [prefix]|--bump-generation [prefix]" >&2
