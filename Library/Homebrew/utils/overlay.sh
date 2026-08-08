@@ -236,34 +236,118 @@ homebrew-overlay-mutation-active() {
   return 0
 }
 
+homebrew-overlay-read-line() {
+  local file="$1"
+  local expected_owner="$2"
+  local max_bytes="${3:-4096}"
+  local file_fd value extra="" byte_count initial_metadata final_metadata
+  local LC_ALL=C
+
+  [[ "${max_bytes}" =~ ^[0-9]+$ && "${max_bytes}" -gt 0 ]] || return 1
+  [[ -f "${file}" && ! -L "${file}" && -r "${file}" ]] || return 1
+  exec {file_fd}<"${file}" || return 1
+  homebrew-overlay-lock-fd-valid "${file_fd}" "${file}" "${expected_owner}" || {
+    exec {file_fd}>&-
+    return 1
+  }
+  initial_metadata="$(stat -Lc '%u %h %f %d %i %s %y %z' -- "/proc/self/fd/${file_fd}")" || {
+    exec {file_fd}>&-
+    return 1
+  }
+  IFS= read -r -u "${file_fd}" value || {
+    exec {file_fd}>&-
+    return 1
+  }
+  if IFS= read -r -u "${file_fd}" extra || [[ -n "${extra}" ]]
+  then
+    exec {file_fd}>&-
+    return 1
+  fi
+  byte_count="$(stat -Lc '%s' -- "/proc/self/fd/${file_fd}")" || {
+    exec {file_fd}>&-
+    return 1
+  }
+  [[ "${byte_count}" -eq $(( ${#value} + 1 )) && "${byte_count}" -le "${max_bytes}" ]] || {
+    exec {file_fd}>&-
+    return 1
+  }
+  final_metadata="$(stat -Lc '%u %h %f %d %i %s %y %z' -- "/proc/self/fd/${file_fd}")" || {
+    exec {file_fd}>&-
+    return 1
+  }
+  homebrew-overlay-lock-fd-valid "${file_fd}" "${file}" "${expected_owner}" || {
+    exec {file_fd}>&-
+    return 1
+  }
+  [[ "${initial_metadata}" == "${final_metadata}" ]] || {
+    exec {file_fd}>&-
+    return 1
+  }
+  exec {file_fd}>&-
+  printf '%s\n' "${value}"
+}
+
+homebrew-overlay-read-digest() {
+  local file="$1"
+  local expected_owner="$2"
+  local file_fd digest initial_metadata final_metadata
+
+  [[ -f "${file}" && ! -L "${file}" && -r "${file}" ]] || return 1
+  exec {file_fd}<"${file}" || return 1
+  homebrew-overlay-lock-fd-valid "${file_fd}" "${file}" "${expected_owner}" || {
+    exec {file_fd}>&-
+    return 1
+  }
+  initial_metadata="$(stat -Lc '%u %h %f %d %i %s %y %z' -- "/proc/self/fd/${file_fd}")" || {
+    exec {file_fd}>&-
+    return 1
+  }
+  digest="$(sha256sum <&"${file_fd}" | awk '{print $1}')" || {
+    exec {file_fd}>&-
+    return 1
+  }
+  homebrew-overlay-base-generation-valid "${digest}" || {
+    exec {file_fd}>&-
+    return 1
+  }
+  final_metadata="$(stat -Lc '%u %h %f %d %i %s %y %z' -- "/proc/self/fd/${file_fd}")" || {
+    exec {file_fd}>&-
+    return 1
+  }
+  homebrew-overlay-lock-fd-valid "${file_fd}" "${file}" "${expected_owner}" || {
+    exec {file_fd}>&-
+    return 1
+  }
+  [[ "${initial_metadata}" == "${final_metadata}" ]] || {
+    exec {file_fd}>&-
+    return 1
+  }
+  exec {file_fd}>&-
+  printf '%s\n' "${digest}"
+}
+
 homebrew-overlay-read-generation-dirty() {
   local prefix="$1"
-  local dirty_file generation
-  local -a lines=()
+  local dirty_file generation owner
 
   dirty_file="$(homebrew-overlay-generation-dirty-file "${prefix}")" || return 1
   [[ -e "${dirty_file}" || -L "${dirty_file}" ]] || return 1
-  [[ -f "${dirty_file}" && ! -L "${dirty_file}" && -r "${dirty_file}" ]] || {
+  owner="$(stat -Lc '%u' -- "${prefix}")" || return 2
+  generation="$(homebrew-overlay-read-line "${dirty_file}" "${owner}" 65)" || {
     echo "Error: invalid Homebrew overlay dirty generation marker: ${dirty_file}" >&2
     return 2
   }
-  mapfile -t lines <"${dirty_file}" || return 2
-  ((${#lines[@]} == 1)) || return 2
-  generation="${lines[0]}"
   homebrew-overlay-base-generation-valid "${generation}" || return 2
   printf '%s\n' "${generation}"
 }
 
 homebrew-overlay-read-generation() {
   local prefix="$1"
-  local generation_file generation
-  local -a lines=()
+  local generation_file generation owner
 
   generation_file="$(homebrew-overlay-generation-file "${prefix}")" || return 1
-  [[ -f "${generation_file}" && ! -L "${generation_file}" && -r "${generation_file}" ]] || return 1
-  mapfile -t lines <"${generation_file}" || return 1
-  ((${#lines[@]} == 1)) || return 1
-  generation="${lines[0]}"
+  owner="$(stat -Lc '%u' -- "${prefix}")" || return 1
+  generation="$(homebrew-overlay-read-line "${generation_file}" "${owner}" 65)" || return 1
   homebrew-overlay-base-generation-valid "${generation}" || return 1
   printf '%s\n' "${generation}"
 }
@@ -559,13 +643,12 @@ homebrew-overlay-initialize-prefix() {
     return 1
   }
 
-  if [[ -L "${marker}" || ( -e "${marker}" && ! -f "${marker}" ) ]]
+  if [[ -e "${marker}" || -L "${marker}" ]]
   then
-    echo "Error: refusing to use unsafe overlay marker: ${marker}" >&2
-    return 1
-  elif [[ -r "${marker}" ]]
-  then
-    IFS= read -r existing_base <"${marker}" || return 1
+    existing_base="$(homebrew-overlay-read-line "${marker}" "${EUID}" 4096)" || {
+      echo "Error: refusing to use unsafe overlay marker: ${marker}" >&2
+      return 1
+    }
     if [[ "${existing_base}" != "${base_prefix}" ]]
     then
       echo "Error: ${prefix} already overlays ${existing_base}, not ${base_prefix}" >&2
@@ -673,26 +756,59 @@ homebrew-overlay-load-state() {
   local file="$1"
   local array_name="$2"
   local base_prefix="$3"
-  local relative target
+  local file_fd relative target initial_metadata final_metadata
   local -n output_map="${array_name}"
   output_map=()
   [[ -e "${file}" || -L "${file}" ]] || return 0
   [[ -f "${file}" && ! -L "${file}" && -O "${file}" && -r "${file}" ]] || return 1
-  [[ "$(stat -Lc '%h' -- "${file}")" == 1 ]] || return 1
+  exec {file_fd}<"${file}" || return 1
+  homebrew-overlay-lock-fd-valid "${file_fd}" "${file}" "${EUID}" || {
+    exec {file_fd}>&-
+    return 1
+  }
+  initial_metadata="$(stat -Lc '%u %h %f %d %i %s %y %z' -- "/proc/self/fd/${file_fd}")" || {
+    exec {file_fd}>&-
+    return 1
+  }
   while :
   do
     relative=""
-    if ! IFS= read -r -d '' relative
+    if ! IFS= read -r -d '' -u "${file_fd}" relative
     then
-      [[ -z "${relative}" ]] || return 1
+      [[ -z "${relative}" ]] || {
+        exec {file_fd}>&-
+        return 1
+      }
       break
     fi
     target=""
-    IFS= read -r -d '' target || return 1
-    homebrew-overlay-view-pair-valid "${base_prefix}" "${relative}" "${target}" || return 1
-    [[ -z "${output_map[${relative}]+present}" ]] || return 1
+    IFS= read -r -d '' -u "${file_fd}" target || {
+      exec {file_fd}>&-
+      return 1
+    }
+    homebrew-overlay-view-pair-valid "${base_prefix}" "${relative}" "${target}" || {
+      exec {file_fd}>&-
+      return 1
+    }
+    [[ -z "${output_map[${relative}]+present}" ]] || {
+      exec {file_fd}>&-
+      return 1
+    }
     output_map["${relative}"]="${target}"
-  done <"${file}"
+  done
+  final_metadata="$(stat -Lc '%u %h %f %d %i %s %y %z' -- "/proc/self/fd/${file_fd}")" || {
+    exec {file_fd}>&-
+    return 1
+  }
+  homebrew-overlay-lock-fd-valid "${file_fd}" "${file}" "${EUID}" || {
+    exec {file_fd}>&-
+    return 1
+  }
+  [[ "${initial_metadata}" == "${final_metadata}" ]] || {
+    exec {file_fd}>&-
+    return 1
+  }
+  exec {file_fd}>&-
 }
 
 homebrew-overlay-state-links-match() {
@@ -720,9 +836,7 @@ homebrew-overlay-state-links-match() {
 homebrew-overlay-state-digest() {
   local state_file="$1"
 
-  [[ -f "${state_file}" && ! -L "${state_file}" && -O "${state_file}" && -r "${state_file}" ]] || return 2
-  [[ "$(stat -Lc '%h' -- "${state_file}")" == 1 ]] || return 2
-  sha256sum "${state_file}" | awk '{print $1}'
+  homebrew-overlay-read-digest "${state_file}" "${EUID}" || return 2
 }
 
 homebrew-overlay-fast-view-current() {
@@ -1290,13 +1404,9 @@ homebrew-overlay-update-base-drift() {
       recorded="missing"
       if [[ -e "${marker}" || -L "${marker}" ]]
       then
-        [[ -f "${marker}" && ! -L "${marker}" ]] || {
+        recorded="$(homebrew-overlay-read-line "${marker}" "${EUID}" 65)" || {
           rm -f -- "${temporary}"
           echo "Error: unsafe base-generation marker: ${marker}" >&2
-          return 1
-        }
-        IFS= read -r recorded <"${marker}" || {
-          rm -f -- "${temporary}"
           return 1
         }
         homebrew-overlay-base-generation-valid "${recorded}" || recorded="invalid"
@@ -1323,8 +1433,14 @@ homebrew-overlay-update-base-drift() {
 
   if [[ -s "${state_file}" ]]
   then
-    warning_key="${base_key}:$(sha256sum "${state_file}" | awk '{print $1}')" || return 1
-    [[ -f "${warned_file}" ]] && IFS= read -r old_warning <"${warned_file}" || true
+    warning_key="${base_key}:$(homebrew-overlay-state-digest "${state_file}")" || return 1
+    if [[ -e "${warned_file}" || -L "${warned_file}" ]]
+    then
+      old_warning="$(homebrew-overlay-read-line "${warned_file}" "${EUID}" 130)" || {
+        echo "Error: unsafe base-generation drift state: ${warned_file}" >&2
+        return 1
+      }
+    fi
     if [[ "${warning_key}" != "${old_warning}" ]]
     then
       echo "Warning: the administrator Homebrew base changed after local formulae were built." >&2
@@ -1427,39 +1543,7 @@ homebrew-overlay-transaction-marker-id() {
 }
 
 homebrew-overlay-read-owned-line() {
-  local file="$1"
-  local file_fd value extra="" byte_count
-  local LC_ALL=C
-
-  [[ -f "${file}" && ! -L "${file}" && -O "${file}" && -r "${file}" ]] || return 1
-  exec {file_fd}<"${file}" || return 1
-  homebrew-overlay-lock-fd-valid "${file_fd}" "${file}" "${EUID}" || {
-    exec {file_fd}>&-
-    return 1
-  }
-  IFS= read -r -u "${file_fd}" value || {
-    exec {file_fd}>&-
-    return 1
-  }
-  if IFS= read -r -u "${file_fd}" extra || [[ -n "${extra}" ]]
-  then
-    exec {file_fd}>&-
-    return 1
-  fi
-  byte_count="$(stat -Lc '%s' -- "/proc/self/fd/${file_fd}")" || {
-    exec {file_fd}>&-
-    return 1
-  }
-  [[ "${byte_count}" -eq $(( ${#value} + 1 )) ]] || {
-    exec {file_fd}>&-
-    return 1
-  }
-  homebrew-overlay-lock-fd-valid "${file_fd}" "${file}" "${EUID}" || {
-    exec {file_fd}>&-
-    return 1
-  }
-  exec {file_fd}>&-
-  printf '%s\n' "${value}"
+  homebrew-overlay-read-line "$1" "${EUID}" 4096
 }
 
 homebrew-overlay-rack-is-exact-inherited-view() {

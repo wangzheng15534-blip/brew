@@ -282,6 +282,31 @@ RSpec.describe Homebrew::Overlay do
     expect(described_class.base_generation_drift).to eq([local_keg])
   end
 
+  it "treats a base-generation marker replaced after opening as drift" do
+    local_keg = user_cellar/"foo/2.0"
+    local_keg.mkpath
+    allow(described_class).to receive(:current_base_generation).and_return(base_generation)
+    described_class.record_base_generation!(local_keg, base_generation)
+    marker = local_keg/Homebrew::Overlay::BASE_GENERATION_MARKER
+    opened_marker = root/"opened-base-generation-marker"
+    replacement = root/"replacement-base-generation-marker"
+    replacement.write("#{base_generation}\n")
+    replacement.chmod 0600
+    flags = File::RDONLY | File::NOFOLLOW
+
+    expect(File).to receive(:open).with(marker, flags).and_wrap_original do |original, *arguments|
+      file = original.call(*arguments)
+      marker.rename(opened_marker)
+      replacement.rename(marker)
+      file
+    end
+
+    expect(described_class.base_generation_drift).to eq([local_keg])
+  ensure
+    marker&.unlink if marker&.exist? || marker&.symlink?
+    opened_marker&.rename(marker) if opened_marker&.exist?
+  end
+
   it "rejects unsafe administrator base-generation markers" do
     local_keg = user_cellar/"foo/2.0"
     local_keg.mkpath

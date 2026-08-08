@@ -814,13 +814,16 @@ module Homebrew
           next unless keg.directory? && !keg.symlink? && valid_version_name?(keg.basename.to_s)
 
           marker = keg/BASE_GENERATION_MARKER
-          if marker.symlink? || !marker.file?
-            drift << keg
-            next
+          recorded = begin
+            read_owned_file(
+              marker,
+              description: "administrator base-generation marker",
+              max_bytes:   65,
+            )
+          rescue TransactionFailure
+            nil
           end
-
-          recorded = marker.read.chomp
-          drift << keg unless recorded.match?(BASE_GENERATION_PATTERN) && recorded == current
+          drift << keg unless recorded == "#{current}\n"
         end
       end
       drift
