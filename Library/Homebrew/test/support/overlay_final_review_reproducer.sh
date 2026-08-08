@@ -1,31 +1,61 @@
 #!/bin/bash
-# Regression gate for every implementation finding in the final native-overlay
-# audit. This file began as a defect reproducer; success now means the corrected
-# behavior was observed and the audited source guards remain present.
+# Aggregate regression gate for the complete native-overlay review. Every
+# standalone overlay support test must be listed here before this gate can pass.
 set -euo pipefail
 
 repo="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd -P)}"
 repo="$(cd "${repo}" && pwd -P)"
+support="${repo}/Library/Homebrew/test/support"
 
-run() {
-  local test_name="$1"
+tests=(
+  overlay_test.sh
+  overlay_review_findings.sh
+  overlay_lock_safety_test.sh
+  overlay_lock_ownership_test.sh
+  overlay_generation_recovery_test.sh
+  overlay_generation_command_lock_test.sh
+  overlay_install_failure_test.sh
+  overlay_transaction_recovery_test.sh
+  overlay_transaction_integrity_test.sh
+  overlay_transaction_publication_durability_test.sh
+  overlay_sync_integrity_test.sh
+  overlay_cellar_integrity_test.sh
+  overlay_rack_recovery_exactness_test.sh
+  overlay_view_reconciliation_test.sh
+  overlay_ruby_reader_integrity_test.sh
+  overlay_marker_reader_integrity_test.sh
+  overlay_removal_partition_test.sh
+  overlay_commit_boundary_test.sh
+)
+
+for candidate in "${support}"/overlay_*test.sh
+do
+  candidate="${candidate##*/}"
+  listed=0
+  for test_name in "${tests[@]}"
+  do
+    if [[ "${candidate}" == "${test_name}" ]]
+    then
+      listed=1
+      break
+    fi
+  done
+  if [[ "${listed}" -ne 1 ]]
+  then
+    echo "Error: overlay regression suite is missing from the aggregate gate: ${candidate}" >&2
+    exit 1
+  fi
+done
+
+for test_name in "${tests[@]}"
+do
+  test_path="${support}/${test_name}"
+  [[ -f "${test_path}" && -x "${test_path}" ]] || {
+    echo "Error: unavailable overlay regression suite: ${test_name}" >&2
+    exit 1
+  }
   printf '=== %s ===\n' "${test_name}"
-  bash "${repo}/Library/Homebrew/test/support/${test_name}" "${repo}"
-}
+  bash "${test_path}" "${repo}"
+done
 
-# F1: live transaction ownership and abandoned-journal recovery.
-run overlay_transaction_recovery_test.sh
-
-# F2/F3: convergent version unions, exact target validation, managed removal.
-run overlay_view_reconciliation_test.sh
-
-# F4/F6: force uninstall and autoremove select private kegs from mixed racks.
-run overlay_removal_partition_test.sh
-
-# F5: the durable keg boundary precedes non-reversible native side effects.
-run overlay_commit_boundary_test.sh
-
-# F7: pre-mutation dirty markers, active-owner exclusion, crash recovery.
-run overlay_generation_recovery_test.sh
-
-printf 'final native overlay audit regression gate: PASS\n'
+printf 'complete native overlay audit regression gate: PASS\n'
