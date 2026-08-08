@@ -452,6 +452,40 @@ homebrew-overlay-remove-durable() {
   sync -d -- "${parent}" || return 1
 }
 
+homebrew-overlay-fsync-directory() {
+  local directory="$1"
+
+  [[ -d "${directory}" && ! -L "${directory}" && -O "${directory}" && -w "${directory}" ]] || return 1
+  sync -d -- "${directory}"
+}
+
+homebrew-overlay-move-durable() {
+  local source="$1"
+  local destination="$2"
+  local source_parent="${source%/*}"
+  local destination_parent="${destination%/*}"
+
+  [[ -d "${source_parent}" && ! -L "${source_parent}" && -O "${source_parent}" && -w "${source_parent}" ]] || return 1
+  [[ -d "${destination_parent}" && ! -L "${destination_parent}" &&
+     -O "${destination_parent}" && -w "${destination_parent}" ]] || return 1
+  mv -T -- "${source}" "${destination}" || return 1
+  homebrew-overlay-fsync-directory "${source_parent}" || return 1
+  if [[ "${destination_parent}" != "${source_parent}" ]]
+  then
+    homebrew-overlay-fsync-directory "${destination_parent}" || return 1
+  fi
+}
+
+homebrew-overlay-remove-tree-durable() {
+  local path="$1"
+  local parent="${path%/*}"
+
+  [[ -d "${parent}" && ! -L "${parent}" && -O "${parent}" && -w "${parent}" ]] || return 1
+  rm -rf --one-file-system -- "${path}" || return 1
+  [[ ! -e "${path}" && ! -L "${path}" ]] || return 1
+  homebrew-overlay-fsync-directory "${parent}"
+}
+
 homebrew-overlay-ensure-generation() {
   local prefix="$1"
   local generation_file generation
@@ -1729,12 +1763,15 @@ homebrew-overlay-recover-formula-transactions() {
     homebrew-overlay-path-under "${staging_root}" "${staging_parent}" || return 1
     homebrew-overlay-path-under "${replacement_root}" "${replacement_parent}" || return 1
     homebrew-overlay-path-under "${failed_root}" "${failed_parent}" || return 1
-    rm -rf --one-file-system -- "${staging_root}" "${replacement_root}" "${failed_root}" "${transaction}" || return 1
+    homebrew-overlay-remove-tree-durable "${staging_root}" || return 1
+    homebrew-overlay-remove-tree-durable "${replacement_root}" || return 1
+    homebrew-overlay-remove-tree-durable "${failed_root}" || return 1
+    homebrew-overlay-remove-tree-durable "${transaction}" || return 1
     homebrew-overlay-lock-fd-valid "${owner_lock_fd}" "${owner_lock}" "${EUID}" || {
       exec {owner_lock_fd}>&-
       return 1
     }
-    rm -f -- "${owner_lock}" || return 1
+    homebrew-overlay-remove-durable "${owner_lock}" || return 1
     exec {owner_lock_fd}>&-
   done
 
@@ -1842,10 +1879,12 @@ homebrew-overlay-recover-formula-transactions() {
           homebrew-overlay-remove-version-links "${prefix}" "${final_version}" || return 1
           homebrew-overlay-atomic-write "${transaction}/state" 0600 <<<'recovering-current' || return 1
           homebrew-overlay-safe-mkdir "${prefix}" "${failed_root}" || return 1
+          homebrew-overlay-fsync-directory "${failed_parent%/*}" || return 1
+          homebrew-overlay-fsync-directory "${failed_parent}" || return 1
           [[ ! -e "${failed_rack}" && ! -L "${failed_rack}" ]] || return 1
-          mv -T -- "${local_rack}" "${failed_rack}" || return 1
+          homebrew-overlay-move-durable "${local_rack}" "${failed_rack}" || return 1
           homebrew-overlay-atomic-write "${transaction}/state" 0600 <<<'recovering-previous' || return 1
-          mv -T -- "${replacement_rack}" "${local_rack}" || return 1
+          homebrew-overlay-move-durable "${replacement_rack}" "${local_rack}" || return 1
           homebrew-overlay-atomic-write "${transaction}/state" 0600 <<<'recovering-cleanup' || return 1
         elif [[ "${replacement_marker_id}" == "${id}" ]]
         then
@@ -1869,8 +1908,10 @@ homebrew-overlay-recover-formula-transactions() {
         then
           homebrew-overlay-remove-version-links "${prefix}" "${final_version}" || return 1
           homebrew-overlay-safe-mkdir "${prefix}" "${failed_root}" || return 1
+          homebrew-overlay-fsync-directory "${failed_parent%/*}" || return 1
+          homebrew-overlay-fsync-directory "${failed_parent}" || return 1
           [[ ! -e "${failed_rack}" && ! -L "${failed_rack}" ]] || return 1
-          mv -T -- "${local_rack}" "${failed_rack}" || return 1
+          homebrew-overlay-move-durable "${local_rack}" "${failed_rack}" || return 1
           homebrew-overlay-atomic-write "${transaction}/state" 0600 <<<'recovering-previous' || return 1
           final_marker_id=""
           failed_marker_id="${id}"
@@ -1878,7 +1919,7 @@ homebrew-overlay-recover-formula-transactions() {
         if [[ "${failed_marker_id}" == "${id}" && ! -e "${local_rack}" && ! -L "${local_rack}" ]]
         then
           [[ -e "${replacement_rack}" || -L "${replacement_rack}" ]] || return 1
-          mv -T -- "${replacement_rack}" "${local_rack}" || return 1
+          homebrew-overlay-move-durable "${replacement_rack}" "${local_rack}" || return 1
           homebrew-overlay-atomic-write "${transaction}/state" 0600 <<<'recovering-cleanup' || return 1
         fi
         if [[ "${failed_marker_id}" != "${id}" ]]
@@ -1921,7 +1962,7 @@ homebrew-overlay-recover-formula-transactions() {
           return 1
         elif [[ "${final_marker_id}" == "${id}" ]]
         then
-          rm -f -- "${final_marker}" || return 1
+          homebrew-overlay-remove-durable "${final_marker}" || return 1
         fi
         ;;
       *)
@@ -1941,6 +1982,7 @@ homebrew-overlay-recover-formula-transactions() {
       }
       [[ -e "${local_rack}" || -L "${local_rack}" ]] || {
         ln -s -- "${base_rack}" "${local_rack}" || return 1
+        homebrew-overlay-fsync-directory "${local_rack%/*}" || return 1
       }
       homebrew-overlay-rack-is-exact-inherited-view "${base_rack}" "${local_rack}" || {
         echo "Error: transaction ${id} did not restore an exact inherited rack: ${local_rack}" >&2
@@ -1954,12 +1996,15 @@ homebrew-overlay-recover-formula-transactions() {
     homebrew-overlay-path-under "${staging_root}" "${staging_parent}" || return 1
     homebrew-overlay-path-under "${replacement_root}" "${replacement_parent}" || return 1
     homebrew-overlay-path-under "${failed_root}" "${failed_parent}" || return 1
-    rm -rf --one-file-system -- "${staging_root}" "${replacement_root}" "${failed_root}" "${transaction}" || return 1
+    homebrew-overlay-remove-tree-durable "${staging_root}" || return 1
+    homebrew-overlay-remove-tree-durable "${replacement_root}" || return 1
+    homebrew-overlay-remove-tree-durable "${failed_root}" || return 1
+    homebrew-overlay-remove-tree-durable "${transaction}" || return 1
     homebrew-overlay-lock-fd-valid "${owner_lock_fd}" "${owner_lock}" "${EUID}" || {
       exec {owner_lock_fd}>&-
       return 1
     }
-    rm -f -- "${owner_lock}" || return 1
+    homebrew-overlay-remove-durable "${owner_lock}" || return 1
     exec {owner_lock_fd}>&-
   done
 
@@ -2001,7 +2046,7 @@ homebrew-overlay-recover-formula-transactions() {
       exec {owner_lock_fd}>&-
       return 1
     }
-    rm -f -- "${owner_lock}" || return 1
+    homebrew-overlay-remove-durable "${owner_lock}" || return 1
     exec {owner_lock_fd}>&-
   done
   # Keep validated empty control directories. Removing and recreating them on

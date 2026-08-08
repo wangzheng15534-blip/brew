@@ -145,6 +145,56 @@ RSpec.describe Homebrew::Overlay do
     expect(described_class).to have_received(:sync!)
   end
 
+  it "persists transaction publication metadata before advancing journal states" do
+    add_base_formula("foo", "1.0")
+    transaction = T.must(described_class.begin_formula_transaction(formula, base_generation:))
+    stage(transaction)
+    events = T.let([], T::Array[T.untyped])
+    state_file = transaction.transaction_dir/"state"
+    transaction_marker = transaction.final_version/".brew-overlay-transaction"
+    base_marker = transaction.final_version/".brew-overlay-base-generation"
+
+    allow(described_class).to receive(:durable_atomic_write!).and_wrap_original do |original, path, contents, mode:|
+      events << [:write, path, contents]
+      original.call(path, contents, mode:)
+    end
+    allow(described_class).to receive(:fsync_directory!).and_wrap_original do |original, path, **options|
+      events << [:fsync, path]
+      original.call(path, **options)
+    end
+    allow(described_class).to receive(:fsync_tree!).and_wrap_original do |original, path|
+      events << [:fsync_tree, path]
+      original.call(path)
+    end
+    allow(described_class).to receive(:atomic_exchange!).and_wrap_original do |original, *paths|
+      events << [:exchange, *paths]
+      original.call(*paths)
+    end
+    allow(described_class).to receive(:durable_unlink!).and_wrap_original do |original, path|
+      events << [:unlink, path]
+      original.call(path)
+    end
+
+    transaction.publish!
+    transaction.commit!
+
+    expected = [
+      [:write, transaction_marker, "#{transaction.id}\n"],
+      [:fsync, transaction.staging_rack],
+      [:fsync, transaction.replacement_rack],
+      [:write, state_file, "publishing\n"],
+      [:exchange, transaction.final_rack, transaction.replacement_rack],
+      [:write, state_file, "published\n"],
+      [:fsync_tree, transaction.final_version],
+      [:write, base_marker, "#{base_generation}\n"],
+      [:write, state_file, "committing\n"],
+      [:unlink, transaction_marker],
+      [:write, state_file, "committed\n"],
+    ]
+    positions = expected.map { |event| events.index(event) }
+    expect(positions).to eq(positions.compact.sort)
+  end
+
   it "does not accept a hard-linked transaction marker" do
     add_base_formula("foo", "1.0")
     transaction = T.must(described_class.begin_formula_transaction(formula, base_generation:))

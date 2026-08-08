@@ -202,11 +202,13 @@ module Homebrew
         raise TransactionFailure, "overlay transaction was not published" unless transaction_owns_final?
 
         Overlay.verify_base_generation!(base_generation)
+        Overlay.fsync_tree!(final_version)
+        Overlay.verify_base_generation!(base_generation)
         Overlay.record_base_generation!(final_version, base_generation)
         Overlay.verify_base_generation!(base_generation)
         write_state("committing")
         marker = final_version/TRANSACTION_MARKER
-        marker.unlink
+        Overlay.durable_unlink!(marker)
         write_state("committed")
         @finished = true
         Overlay.clear_caches!
@@ -319,11 +321,6 @@ module Homebrew
         end
       end
 
-      sig { params(directory: Pathname).void }
-      def fsync_directory!(directory)
-        File.open(directory, File::RDONLY | File::NOFOLLOW) { |file| file.fsync }
-      end
-
       sig { params(directory: Pathname, name: String, value: String, exclusive: T::Boolean).void }
       def write_metadata_at(directory, name, value, exclusive:)
         path = directory/name
@@ -336,10 +333,7 @@ module Homebrew
             file.fsync
           end
         else
-          path.atomic_write("#{value}\n")
-          path.chmod 0600
-          File.open(path, File::RDONLY | File::NOFOLLOW) { |file| file.fsync }
-          fsync_directory!(directory)
+          Overlay.durable_atomic_write!(path, "#{value}\n", mode: 0600)
         end
       end
 
@@ -360,13 +354,14 @@ module Homebrew
         write_metadata_at(@pending_transaction_dir, "version", version, exclusive: true)
         write_metadata_at(@pending_transaction_dir, "base_generation", base_generation, exclusive: true)
         write_metadata_at(@pending_transaction_dir, "state", "staging", exclusive: true)
-        fsync_directory!(@pending_transaction_dir)
+        Overlay.fsync_directory!(@pending_transaction_dir)
 
         raise TransactionFailure, "overlay transaction already exists: #{transaction_dir}" if
           transaction_dir.exist? || transaction_dir.symlink?
 
         File.rename(@pending_transaction_dir, transaction_dir)
-        fsync_directory!(Overlay.transactions_dir)
+        Overlay.fsync_directory!(Overlay.transactions_dir)
+        Overlay.fsync_directory!(Overlay.transactions_dir.parent)
       end
 
       sig { params(name: String, value: String).void }
@@ -395,8 +390,12 @@ module Homebrew
 
         File.rename(staging_version, replacement_rack/version)
         marker = replacement_rack/version/TRANSACTION_MARKER
-        marker.atomic_write("#{id}\n")
-        marker.chmod 0600
+        Overlay.durable_atomic_write!(marker, "#{id}\n", mode: 0600)
+        Overlay.fsync_directory!(staging_rack)
+        Overlay.fsync_directory!(replacement_rack)
+        Overlay.fsync_directory!(@replacement_root)
+        Overlay.fsync_directory!(@replacement_root.parent)
+        Overlay.fsync_directory!(@replacement_root.parent.parent)
       end
 
       # Formulae built from source may embed Formula#prefix. During an overlay
@@ -462,18 +461,29 @@ module Homebrew
         prepare_control_directories!
         owner_lock_present = @owner_lock_path.exist? || @owner_lock_path.symlink?
         validate_owner_lock_path! if owner_lock_present
-        FileUtils.rm_rf(@staging_root) if @staging_root.exist? || @staging_root.symlink?
-        FileUtils.rm_rf(@replacement_root) if @replacement_root.exist? || @replacement_root.symlink?
-        if @pending_transaction_dir.exist? || @pending_transaction_dir.symlink?
-          FileUtils.rm_rf(@pending_transaction_dir)
-        end
-        FileUtils.rm_rf(transaction_dir) if transaction_dir.exist? || transaction_dir.symlink?
+        remove_tree_durable!(@staging_root)
+        remove_tree_durable!(@replacement_root)
+        remove_tree_durable!(@pending_transaction_dir)
+        remove_tree_durable!(transaction_dir)
         if owner_lock_present
           validate_owner_lock_path!
           @owner_lock_path.unlink
+          Overlay.fsync_directory!(@owner_lock_path.parent)
         end
       ensure
         release_owner_lock!
+      end
+
+      sig { params(path: Pathname).void }
+      def remove_tree_durable!(path)
+        return unless path.exist? || path.symlink?
+
+        parent = path.parent
+        FileUtils.rm_rf(path)
+        if path.exist? || path.symlink?
+          raise TransactionFailure, "could not remove overlay transaction path: #{path}"
+        end
+        Overlay.fsync_directory!(parent)
       end
     end
 
@@ -626,6 +636,183 @@ module Homebrew
       end
     rescue ArgumentError
       raise TransactionFailure, "overlay directory escapes the native prefix: #{directory}"
+    end
+
+    sig {
+      params(
+        directory: Pathname,
+        expected_device: T.nilable(Integer),
+        expected_inode: T.nilable(Integer),
+      ).void
+    }
+    def self.fsync_directory!(directory, expected_device: nil, expected_inode: nil)
+      directory = directory.expand_path
+      flags = File::RDONLY | File::NOFOLLOW
+      File.open(directory, flags) do |file|
+        descriptor_stat = file.stat
+        path_stat = directory.lstat
+        expected_identity = (expected_device.nil? && expected_inode.nil?) ||
+                            (descriptor_stat.dev == expected_device && descriptor_stat.ino == expected_inode)
+        safe_directory = descriptor_stat.directory? && descriptor_stat.uid == Process.uid &&
+                         path_stat.directory? && path_stat.uid == Process.uid &&
+                         descriptor_stat.dev == path_stat.dev && descriptor_stat.ino == path_stat.ino &&
+                         expected_identity
+        raise TransactionFailure, "unsafe overlay durability directory: #{directory}" unless safe_directory
+
+        file.fsync
+        final_descriptor_stat = file.stat
+        final_path_stat = directory.lstat
+        stable_directory = descriptor_stat.dev == final_descriptor_stat.dev &&
+                           descriptor_stat.ino == final_descriptor_stat.ino &&
+                           descriptor_stat.mode == final_descriptor_stat.mode &&
+                           descriptor_stat.uid == final_descriptor_stat.uid &&
+                           descriptor_stat.gid == final_descriptor_stat.gid &&
+                           descriptor_stat.nlink == final_descriptor_stat.nlink &&
+                           final_descriptor_stat.dev == final_path_stat.dev &&
+                           final_descriptor_stat.ino == final_path_stat.ino &&
+                           final_descriptor_stat.mode == final_path_stat.mode &&
+                           final_descriptor_stat.uid == final_path_stat.uid &&
+                           final_descriptor_stat.gid == final_path_stat.gid &&
+                           final_descriptor_stat.nlink == final_path_stat.nlink
+        raise TransactionFailure, "changed overlay durability directory: #{directory}" unless stable_directory
+      end
+    rescue TransactionFailure
+      raise
+    rescue SystemCallError, IOError => e
+      raise TransactionFailure, "could not fsync overlay directory #{directory}: #{e.message}"
+    end
+
+    sig { params(root: Pathname).void }
+    def self.fsync_tree!(root)
+      root = root.expand_path
+      root_stat = root.lstat
+      unless root_stat.directory? && root_stat.uid == Process.uid
+        raise TransactionFailure, "unsafe overlay durability tree: #{root}"
+      end
+
+      directories = T.let([], T::Array[[Pathname, Integer, Integer]])
+      root.find do |path|
+        path_stat = path.lstat
+        if path_stat.symlink?
+          next
+        elsif path_stat.directory?
+          if path_stat.uid != Process.uid
+            raise TransactionFailure, "unowned overlay durability directory: #{path}"
+          end
+          directories << [path, path_stat.dev, path_stat.ino]
+          next
+        elsif !path_stat.file?
+          raise TransactionFailure, "unsupported overlay durability entry: #{path}"
+        end
+
+        flags = File::RDONLY | File::NOFOLLOW
+        File.open(path, flags) do |file|
+          descriptor_stat = file.stat
+          current_path_stat = path.lstat
+          safe_file = descriptor_stat.file? && descriptor_stat.uid == Process.uid &&
+                      current_path_stat.file? && current_path_stat.uid == Process.uid &&
+                      descriptor_stat.dev == current_path_stat.dev && descriptor_stat.ino == current_path_stat.ino
+          raise TransactionFailure, "unsafe overlay durability file: #{path}" unless safe_file
+
+          file.fsync
+          final_descriptor_stat = file.stat
+          final_path_stat = path.lstat
+          stable_file = descriptor_stat.dev == final_descriptor_stat.dev &&
+                        descriptor_stat.ino == final_descriptor_stat.ino &&
+                        descriptor_stat.mode == final_descriptor_stat.mode &&
+                        descriptor_stat.uid == final_descriptor_stat.uid &&
+                        descriptor_stat.nlink == final_descriptor_stat.nlink &&
+                        descriptor_stat.size == final_descriptor_stat.size &&
+                        descriptor_stat.mtime == final_descriptor_stat.mtime &&
+                        descriptor_stat.ctime == final_descriptor_stat.ctime &&
+                        final_descriptor_stat.dev == final_path_stat.dev &&
+                        final_descriptor_stat.ino == final_path_stat.ino &&
+                        final_descriptor_stat.mode == final_path_stat.mode &&
+                        final_descriptor_stat.uid == final_path_stat.uid &&
+                        final_descriptor_stat.nlink == final_path_stat.nlink
+          raise TransactionFailure, "changed overlay durability file: #{path}" unless stable_file
+        end
+      end
+      directories.reverse_each do |directory, device, inode|
+        fsync_directory!(directory, expected_device: device, expected_inode: inode)
+      end
+    rescue TransactionFailure
+      raise
+    rescue SystemCallError, IOError => e
+      raise TransactionFailure, "could not fsync overlay tree #{root}: #{e.message}"
+    end
+
+    sig { params(path: Pathname, contents: String, mode: Integer).void }
+    def self.durable_atomic_write!(path, contents, mode:)
+      path = path.expand_path
+      if path.symlink? || (path.exist? && !path.file?)
+        raise TransactionFailure, "unsafe overlay durability file: #{path}"
+      end
+
+      path.atomic_write(contents)
+      path.chmod(mode)
+      flags = File::RDONLY | File::NOFOLLOW
+      File.open(path, flags) do |file|
+        descriptor_stat = file.stat
+        path_stat = path.lstat
+        safe_file = descriptor_stat.file? && descriptor_stat.uid == Process.uid && descriptor_stat.nlink == 1 &&
+                    descriptor_stat.size == contents.bytesize && (descriptor_stat.mode & 0777) == mode &&
+                    path_stat.file? && path_stat.uid == Process.uid && path_stat.nlink == 1 &&
+                    descriptor_stat.dev == path_stat.dev &&
+                    descriptor_stat.ino == path_stat.ino
+        raise TransactionFailure, "unsafe overlay durability file: #{path}" unless safe_file
+
+        file.fsync
+        final_descriptor_stat = file.stat
+        final_path_stat = path.lstat
+        stable_file = descriptor_stat.dev == final_descriptor_stat.dev &&
+                      descriptor_stat.ino == final_descriptor_stat.ino &&
+                      descriptor_stat.mode == final_descriptor_stat.mode &&
+                      descriptor_stat.uid == final_descriptor_stat.uid &&
+                      descriptor_stat.nlink == final_descriptor_stat.nlink &&
+                      descriptor_stat.size == final_descriptor_stat.size &&
+                      descriptor_stat.mtime == final_descriptor_stat.mtime &&
+                      descriptor_stat.ctime == final_descriptor_stat.ctime &&
+                      final_descriptor_stat.dev == final_path_stat.dev &&
+                      final_descriptor_stat.ino == final_path_stat.ino &&
+                      final_descriptor_stat.mode == final_path_stat.mode &&
+                      final_descriptor_stat.uid == final_path_stat.uid &&
+                      final_descriptor_stat.nlink == final_path_stat.nlink &&
+                      final_descriptor_stat.size == final_path_stat.size &&
+                      final_descriptor_stat.mtime == final_path_stat.mtime &&
+                      final_descriptor_stat.ctime == final_path_stat.ctime
+        raise TransactionFailure, "changed overlay durability file: #{path}" unless stable_file
+      end
+      fsync_directory!(path.parent)
+    rescue TransactionFailure
+      raise
+    rescue SystemCallError, IOError => e
+      raise TransactionFailure, "could not durably write overlay file #{path}: #{e.message}"
+    end
+
+    sig { params(path: Pathname).void }
+    def self.durable_unlink!(path)
+      path = path.expand_path
+      flags = File::RDONLY | File::NOFOLLOW
+      File.open(path, flags) do |file|
+        descriptor_stat = file.stat
+        path_stat = path.lstat
+        safe_file = descriptor_stat.file? && descriptor_stat.uid == Process.uid && descriptor_stat.nlink == 1 &&
+                    (descriptor_stat.mode & 0022).zero? && path_stat.file? && path_stat.uid == Process.uid &&
+                    path_stat.nlink == 1 && descriptor_stat.dev == path_stat.dev &&
+                    descriptor_stat.ino == path_stat.ino
+        raise TransactionFailure, "unsafe overlay durability file: #{path}" unless safe_file
+
+        path.unlink
+        fsync_directory!(path.parent)
+        unless file.stat.nlink.zero? && !path.exist? && !path.symlink?
+          raise TransactionFailure, "changed overlay durability file while removing: #{path}"
+        end
+      end
+    rescue TransactionFailure
+      raise
+    rescue SystemCallError, IOError => e
+      raise TransactionFailure, "could not durably remove overlay file #{path}: #{e.message}"
     end
 
     sig { params(path: T.any(Pathname, String)).returns(T::Boolean) }
@@ -797,8 +984,7 @@ module Homebrew
         raise TransactionFailure, "unsafe administrator base-generation marker: #{marker}"
       end
 
-      marker.atomic_write("#{generation}\n")
-      marker.chmod 0600
+      durable_atomic_write!(marker, "#{generation}\n", mode: 0600)
     end
 
     sig { returns(T::Array[Pathname]) }
@@ -894,7 +1080,11 @@ module Homebrew
         Fiddle::TYPE_LONG,
       )
       result = syscall.call(syscall_number, AT_FDCWD, left.to_s, AT_FDCWD, right.to_s, RENAME_EXCHANGE)
-      return if result.zero?
+      if result.zero?
+        parents = [left.parent, right.parent].uniq
+        parents.each { |parent| fsync_directory!(parent) }
+        return
+      end
 
       error = Fiddle.last_error
       raise SystemCallError.new("atomic overlay rack exchange failed", error)
