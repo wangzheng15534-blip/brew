@@ -335,15 +335,21 @@ RSpec.describe Homebrew::Overlay do
 
   it "marks the prefix dirty before advancing its generation" do
     script = HOMEBREW_LIBRARY_PATH/"utils/overlay.sh"
-    owner_matcher = a_string_matching(/\A[0-9]+-[0-9]+-[0-9a-f]{32}\z/)
-    expected_environment = hash_including("HOMEBREW_OVERLAY_MUTATION_OWNER" => owner_matcher)
+    descriptor = described_class::MUTATION_LOCK_DESCRIPTOR
 
-    expect(Homebrew).to receive(:safe_system)
-      .with(expected_environment, "/bin/bash", script, "--mark-generation-dirty", prefix.to_s)
-      .ordered
-    expect(Homebrew).to receive(:safe_system)
-      .with(expected_environment, "/bin/bash", script, "--bump-generation", prefix.to_s)
-      .ordered
+    expect(Homebrew).to receive(:safe_system).ordered do |environment, command, path, action, argument, **options|
+      expect(environment).to include("HOMEBREW_OVERLAY_MUTATION_LOCK_FD" => descriptor.to_s)
+      expect([command, path, action, argument]).to eq(["/bin/bash", script, "--mark-generation-dirty", prefix.to_s])
+      expect(options.fetch(descriptor)).to be_a(File)
+    end
+    expect(Homebrew).to receive(:safe_system).ordered do |environment, command, path, action, argument, **options|
+      expect(environment).to include(
+        "HOMEBREW_OVERLAY_MUTATION_LOCK_FD" => descriptor.to_s,
+        "HOMEBREW_OVERLAY_FINALIZE_MUTATION" => "1",
+      )
+      expect([command, path, action, argument]).to eq(["/bin/bash", script, "--bump-generation", prefix.to_s])
+      expect(options.fetch(descriptor)).to be_a(File)
+    end
 
     described_class.begin_mutation!
     expect(described_class.mutation_active?).to be(true)

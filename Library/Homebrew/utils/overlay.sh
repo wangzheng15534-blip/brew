@@ -89,10 +89,6 @@ homebrew-overlay-mutation-lock-file() {
   printf '%s\n' "${prefix}/var/homebrew/locks/overlay-mutation.lock"
 }
 
-homebrew-overlay-mutation-owner-valid() {
-  [[ "$1" =~ ^[A-Za-z0-9._-]{16,128}$ ]]
-}
-
 homebrew-overlay-lock-path-valid() {
   local lock_file="$1"
   local expected_owner="$2"
@@ -128,6 +124,29 @@ homebrew-overlay-lock-fd-valid() {
      "${path_mode}" == "${fd_mode}" && "${path_device}" == "${fd_device}" &&
      "${path_inode}" == "${fd_inode}" ]] || return 1
   (( (16#${path_mode} & 0170000) == 0100000 && (16#${path_mode} & 0022) == 0 ))
+}
+
+homebrew-overlay-lock-fd-number-valid() {
+  [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 10 && $1 <= 1023 ))
+}
+
+homebrew-overlay-inherited-lock-fd-valid() {
+  local lock_fd="$1"
+  local lock_file="$2"
+  local expected_owner="$3"
+  local expected_mode="$4"
+  local fd_path="/proc/self/fd/${lock_fd}"
+  local fdinfo="/proc/self/fdinfo/${lock_fd}"
+  local mode
+
+  homebrew-overlay-lock-fd-number-valid "${lock_fd}" || return 1
+  homebrew-overlay-lock-fd-valid "${lock_fd}" "${lock_file}" "${expected_owner}" || return 1
+  mode="$(stat -Lc '%a' -- "${fd_path}")" || return 1
+  [[ "${mode}" == "${expected_mode}" && -r "${fdinfo}" ]] || return 1
+  grep -Eq \
+    '^lock:[[:space:]]+[0-9]+:[[:space:]]+FLOCK[[:space:]]+ADVISORY[[:space:]]+WRITE[[:space:]]' \
+    "${fdinfo}" || return 1
+  homebrew-overlay-lock-fd-valid "${lock_fd}" "${lock_file}" "${expected_owner}" || return 1
 }
 
 homebrew-overlay-prepare-mutation-lock() {
@@ -1990,10 +2009,10 @@ homebrew-overlay-sync-unlocked() {
   # A dirty local generation belongs either to this explicitly finalizing
   # mutation or to a crashed process whose global mutation lock was acquired by
   # this synchronizer. Rebuild first, then publish a structural generation and
-  # remove the dirty marker. A live owner never reaches this point without the
-  # matching owner token.
+  # remove the dirty marker. A live owner reaches this point only through its
+  # inherited lock-owning descriptor.
   if [[ "${local_dirty}" -eq 1 &&
-        ( "${finalize_mutation}" -eq 1 || -z "${HOMEBREW_OVERLAY_MUTATION_OWNER:-}" ) ]]
+        ( "${finalize_mutation}" -eq 1 || -z "${HOMEBREW_OVERLAY_MUTATION_LOCK_FD:-}" ) ]]
   then
     local_key="$(homebrew-overlay-recover-generation "${prefix}")" || return 1
   fi
@@ -2012,7 +2031,9 @@ EOF_STAMP
 homebrew-overlay-sync() {
   local force=0
   local lock_file mutation_lock base_lock prefix base_prefix base_owner
-  local owner="${HOMEBREW_OVERLAY_MUTATION_OWNER:-}"
+  local inherited_mutation_fd="${HOMEBREW_OVERLAY_MUTATION_LOCK_FD:-}"
+  local owner_transaction_id="${HOMEBREW_OVERLAY_OWNER_TRANSACTION_ID:-}"
+  local owner_transaction_fd="${HOMEBREW_OVERLAY_OWNER_TRANSACTION_LOCK_FD:-}"
   [[ "${1:-}" == "--force" ]] && force=1
   prefix="$(homebrew-overlay-normalize-absolute "${HOMEBREW_PREFIX}")" || return 1
   base_prefix="$(homebrew-overlay-normalize-absolute \
@@ -2037,13 +2058,9 @@ homebrew-overlay-sync() {
     return 1
   }
   (
-    local recorded_owner=""
+    local mutation_fd="" owner_lock transactions
     homebrew-overlay-lock-fd-valid 7 "${base_lock}" "${base_owner}" || {
       echo "Error: unsafe administrator Homebrew mutation lock descriptor" >&2
-      exit 1
-    }
-    homebrew-overlay-lock-fd-valid 8 "${mutation_lock}" "${EUID}" || {
-      echo "Error: unsafe Homebrew overlay mutation lock descriptor" >&2
       exit 1
     }
     homebrew-overlay-lock-fd-valid 9 "${lock_file}" "${EUID}" || {
@@ -2055,31 +2072,56 @@ homebrew-overlay-sync() {
       echo "Error: the administrator Homebrew prefix is being mutated; retry after it finishes" >&2
       exit 1
     }
-    if [[ -n "${owner}" ]]
+
+    if [[ -n "${inherited_mutation_fd}" ]]
     then
-      homebrew-overlay-mutation-owner-valid "${owner}" || {
-        echo "Error: invalid Homebrew overlay mutation owner token" >&2
+      homebrew-overlay-inherited-lock-fd-valid \
+        "${inherited_mutation_fd}" "${mutation_lock}" "${EUID}" 640 || {
+        echo "Error: unsafe inherited Homebrew overlay mutation lock descriptor" >&2
         exit 1
       }
-      if flock -x -n 8
+      mutation_fd="${inherited_mutation_fd}"
+    else
+      if [[ -n "${owner_transaction_id}" || -n "${owner_transaction_fd}" ]]
       then
-        flock -u 8 || true
-        echo "Error: Homebrew overlay mutation owner is not backed by an active lock" >&2
+        echo "Error: an overlay transaction owner requires the inherited mutation lock descriptor" >&2
         exit 1
       fi
-      IFS= read -r -u 8 recorded_owner || true
-      [[ "${recorded_owner}" == "${owner}" ]] || {
-        echo "Error: Homebrew overlay mutation owner does not match the active lock" >&2
+      exec {mutation_fd}<>"${mutation_lock}" || exit 1
+      homebrew-overlay-lock-fd-valid "${mutation_fd}" "${mutation_lock}" "${EUID}" || {
+        echo "Error: unsafe Homebrew overlay mutation lock descriptor" >&2
         exit 1
       }
-    else
-      flock -x -n 8 || {
+      flock -x -n "${mutation_fd}" || {
         echo "Error: another Homebrew package mutation is still active; retry after it finishes" >&2
         exit 1
       }
     fi
+
+    if [[ -n "${owner_transaction_id}" || -n "${owner_transaction_fd}" ]]
+    then
+      [[ -n "${owner_transaction_id}" && -n "${owner_transaction_fd}" ]] || {
+        echo "Error: incomplete inherited overlay transaction ownership" >&2
+        exit 1
+      }
+      [[ "${owner_transaction_id}" =~ ^[A-Za-z0-9._-]+$ ]] &&
+        homebrew-overlay-valid-relative-path "${owner_transaction_id}" &&
+        [[ "${owner_transaction_id}" != */* ]] || {
+        echo "Error: invalid inherited overlay transaction identifier" >&2
+        exit 1
+      }
+      transactions="${prefix}/var/homebrew/overlay/transactions"
+      owner_lock="${transactions}/.locks/${owner_transaction_id}.lock"
+      homebrew-overlay-path-under "${owner_lock}" "${transactions}/.locks" || exit 1
+      homebrew-overlay-inherited-lock-fd-valid \
+        "${owner_transaction_fd}" "${owner_lock}" "${EUID}" 600 || {
+        echo "Error: unsafe inherited overlay transaction owner lock descriptor" >&2
+        exit 1
+      }
+    fi
+
     homebrew-overlay-sync-unlocked "${force}"
-  ) 7<"${base_lock}" 8<>"${mutation_lock}" 9<>"${lock_file}"
+  ) 7<"${base_lock}" 9<>"${lock_file}"
 }
 
 homebrew-overlay-bootstrap() {

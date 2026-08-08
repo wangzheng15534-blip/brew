@@ -178,7 +178,13 @@ fi
 test -d "${case0}/user/var/homebrew/overlay/transactions/txn-live"
 test -d "${case0}/user/Cellar/.homebrew-overlay-staging/txn-live"
 grep -q 'transaction is still active' "${case0}/stderr"
-HOMEBREW_OVERLAY_OWNER_TRANSACTION_ID=txn-live homebrew-overlay-sync --force
+if HOMEBREW_OVERLAY_OWNER_TRANSACTION_ID=txn-live \
+  homebrew-overlay-sync --force >"${case0}/id.out" 2>"${case0}/id.err"
+then
+  echo "transaction identifier without inherited descriptors unexpectedly synchronized" >&2
+  exit 1
+fi
+grep -q 'requires the inherited mutation lock descriptor' "${case0}/id.err"
 test -d "${case0}/user/var/homebrew/overlay/transactions/txn-live"
 test -d "${case0}/user/Cellar/.homebrew-overlay-staging/txn-live"
 kill "${owner_pid}" 2>/dev/null || true

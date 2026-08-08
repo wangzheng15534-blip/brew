@@ -19,6 +19,19 @@ cleanup() {
 }
 trap cleanup EXIT
 
+wait_for_lock_release() {
+  local lock_file="$1"
+  for _ in {1..200}
+  do
+    if flock -xn "${lock_file}" -c true
+    then
+      return 0
+    fi
+    sleep 0.01
+  done
+  return 1
+}
+
 make_case() {
   local root="$1"
   mkdir -p \
@@ -44,7 +57,9 @@ activate() {
   export HOMEBREW_OVERLAY_BASE_PREFIX="${root}/base"
   export HOMEBREW_OVERLAY=1
   export HOMEBREW_OVERLAY_ACTIVE=1
-  unset HOMEBREW_OVERLAY_MUTATION_OWNER HOMEBREW_OVERLAY_FINALIZE_MUTATION
+  unset HOMEBREW_OVERLAY_MUTATION_OWNER HOMEBREW_OVERLAY_FINALIZE_MUTATION \
+    HOMEBREW_OVERLAY_MUTATION_LOCK_FD HOMEBREW_OVERLAY_OWNER_TRANSACTION_ID \
+    HOMEBREW_OVERLAY_OWNER_TRANSACTION_LOCK_FD
 }
 
 # A crashed user mutation leaves the explicit generation unchanged but a dirty
@@ -64,19 +79,12 @@ mutation_lock="$(homebrew-overlay-prepare-mutation-lock "${case_user}/user")"
 ) 8<>"${mutation_lock}"
 test -f "$(homebrew-overlay-generation-dirty-file "${case_user}/user")"
 test "$(homebrew-overlay-read-generation "${case_user}/user")" = "${old_generation}"
-# Matching stale content is insufficient: only the process that still holds the
-# advisory lock may use an owner token to finalize a mutation.
+# Stale lock-file contents and the retired owner-token variable are ignored.
+# With the crashed owner's flock gone, ordinary recovery must still reconcile
+# the dirty structure instead of treating the token as authorization evidence.
 export HOMEBREW_OVERLAY_MUTATION_OWNER='crashed-user-owner-token-0001'
-export HOMEBREW_OVERLAY_FINALIZE_MUTATION=1
-if homebrew-overlay-sync >"${case_user}/stale-owner.out" 2>"${case_user}/stale-owner.err"
-then
-  echo 'stale mutation owner token unexpectedly synchronized' >&2
-  exit 1
-fi
-grep -q 'not backed by an active lock' "${case_user}/stale-owner.err"
-unset HOMEBREW_OVERLAY_MUTATION_OWNER HOMEBREW_OVERLAY_FINALIZE_MUTATION
-test -f "$(homebrew-overlay-generation-dirty-file "${case_user}/user")"
 homebrew-overlay-sync
+unset HOMEBREW_OVERLAY_MUTATION_OWNER
 test ! -e "$(homebrew-overlay-generation-dirty-file "${case_user}/user")"
 recovered_generation="$(homebrew-overlay-read-generation "${case_user}/user")"
 test "${recovered_generation}" = "$(homebrew-overlay-structural-view-key "${case_user}/user")"
@@ -121,6 +129,7 @@ test -d "${case_live}/user/Cellar/live-local/1.0"
 kill "${owner_pid}" 2>/dev/null || true
 wait "${owner_pid}" 2>/dev/null || true
 owner_pid=""
+wait_for_lock_release "${mutation_lock}"
 homebrew-overlay-sync --force
 test ! -e "$(homebrew-overlay-generation-dirty-file "${case_live}/user")"
 test -d "${case_live}/user/Cellar/live-local/1.0"
@@ -188,6 +197,7 @@ test ! -e "${case_base_live}/user/Cellar/transient-base"
 kill "${owner_pid}" 2>/dev/null || true
 wait "${owner_pid}" 2>/dev/null || true
 owner_pid=""
+wait_for_lock_release "${base_lock}"
 homebrew-overlay-sync --force
 test -L "${case_base_live}/user/Cellar/transient-base"
 

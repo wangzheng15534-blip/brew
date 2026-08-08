@@ -19,7 +19,6 @@ module Homebrew
     @link_state_entries = T.let(nil, T.nilable(T::Hash[String, String]))
     @install_transactions = T.let({}, T::Hash[String, T.untyped])
     @mutation_lock = T.let(nil, T.nilable(File))
-    @mutation_owner = T.let(nil, T.nilable(String))
 
     class InheritedKegError < RuntimeError
       extend T::Sig
@@ -55,6 +54,8 @@ module Homebrew
     BASE_GENERATION_PATTERN = /\A[0-9a-f]{64}\z/
     AT_FDCWD = -100
     RENAME_EXCHANGE = 2
+    MUTATION_LOCK_DESCRIPTOR = 198
+    TRANSACTION_LOCK_DESCRIPTOR = 199
     RENAMEAT2_SYSCALLS = T.let(
       {
         "x86_64"  => 316,
@@ -106,6 +107,16 @@ module Homebrew
 
       sig { returns(T::Boolean) }
       def finished? = @finished
+
+      sig { returns(File) }
+      def owner_lock
+        owner_lock = @owner_lock
+        if owner_lock.nil? || owner_lock.closed?
+          raise TransactionFailure, "overlay transaction owner lock is not open: #{@owner_lock_path}"
+        end
+
+        owner_lock
+      end
 
       sig { params(formula: T.untyped, base_generation: String).void }
       def initialize(formula, base_generation:)
@@ -197,7 +208,7 @@ module Homebrew
         write_state("committed")
         @finished = true
         Overlay.clear_caches!
-        Overlay.sync!(mutation: true, owner_transaction_id: id)
+        Overlay.sync!(mutation: true, owner_transaction: self)
         cleanup_paths!
       end
 
@@ -215,7 +226,7 @@ module Homebrew
         end
 
         Overlay.clear_caches!
-        Overlay.sync!(mutation: true, owner_transaction_id: id)
+        Overlay.sync!(mutation: true, owner_transaction: self)
         cleanup_paths!
         @finished = true
       end
@@ -995,18 +1006,12 @@ module Homebrew
       lock.chmod 0640
       lock.close_on_exec = true
       lock.flock(File::LOCK_EX)
-      owner = "#{Process.pid}-#{Thread.current.object_id}-#{SecureRandom.hex(16)}"
-      lock.rewind
-      lock.truncate(0)
-      lock.write("#{owner}\n")
-      lock.flush
-      lock.fsync
       @mutation_lock = lock
-      @mutation_owner = owner
 
       script = HOMEBREW_LIBRARY_PATH/"utils/overlay.sh"
-      Homebrew.safe_system mutation_environment, "/bin/bash", script,
-                           "--mark-generation-dirty", HOMEBREW_PREFIX.to_s
+      environment, options = mutation_process_context
+      Homebrew.safe_system environment, "/bin/bash", script,
+                           "--mark-generation-dirty", HOMEBREW_PREFIX.to_s, **options
     rescue Exception # rubocop:disable Lint/RescueException
       release_mutation_lock!
       raise
@@ -1023,26 +1028,24 @@ module Homebrew
       begin_mutation! unless mutation_active?
 
       script = HOMEBREW_LIBRARY_PATH/"utils/overlay.sh"
-      Homebrew.safe_system mutation_environment, "/bin/bash", script,
-                           "--bump-generation", HOMEBREW_PREFIX.to_s
+      environment, options = mutation_process_context(finalize: true)
+      Homebrew.safe_system environment, "/bin/bash", script,
+                           "--bump-generation", HOMEBREW_PREFIX.to_s, **options
       release_mutation_lock!
     rescue Exception # rubocop:disable Lint/RescueException
       release_mutation_lock!
       raise
     end
 
-    sig { params(mutation: T::Boolean, owner_transaction_id: T.nilable(String)).void }
-    def self.sync!(mutation: false, owner_transaction_id: nil)
+    sig { params(mutation: T::Boolean, owner_transaction: T.nilable(FormulaTransaction)).void }
+    def self.sync!(mutation: false, owner_transaction: nil)
       return unless active?
 
       begin_mutation! if mutation && !mutation_active?
 
       script = HOMEBREW_LIBRARY_PATH/"utils/overlay.sh"
-      environment = mutation_environment(finalize: mutation)
-      if owner_transaction_id
-        environment["HOMEBREW_OVERLAY_OWNER_TRANSACTION_ID"] = owner_transaction_id
-      end
-      Homebrew.safe_system environment, "/bin/bash", script, "--sync"
+      environment, options = mutation_process_context(finalize: mutation, owner_transaction:)
+      Homebrew.safe_system environment, "/bin/bash", script, "--sync", **options
       release_mutation_lock! if mutation
       @link_state_entries = nil
     rescue Exception # rubocop:disable Lint/RescueException
@@ -1050,15 +1053,37 @@ module Homebrew
       raise
     end
 
-    sig { params(finalize: T::Boolean).returns(T::Hash[String, T.nilable(String)]) }
-    def self.mutation_environment(finalize: false)
+    sig {
+      params(
+        finalize: T::Boolean,
+        owner_transaction: T.nilable(FormulaTransaction),
+      ).returns([T::Hash[String, T.nilable(String)], T::Hash[T.untyped, T.untyped]])
+    }
+    def self.mutation_process_context(finalize: false, owner_transaction: nil)
       environment = T.let({}, T::Hash[String, T.nilable(String)])
-      owner = @mutation_owner
-      environment["HOMEBREW_OVERLAY_MUTATION_OWNER"] = owner if owner
+      options = T.let({}, T::Hash[T.untyped, T.untyped])
+      mutation_lock = @mutation_lock
+      if mutation_lock
+        raise TransactionFailure, "overlay mutation lock is closed" if mutation_lock.closed?
+
+        environment["HOMEBREW_OVERLAY_MUTATION_LOCK_FD"] = MUTATION_LOCK_DESCRIPTOR.to_s
+        options[MUTATION_LOCK_DESCRIPTOR] = mutation_lock
+      end
       environment["HOMEBREW_OVERLAY_FINALIZE_MUTATION"] = "1" if finalize
-      environment
+
+      if owner_transaction
+        unless mutation_lock
+          raise TransactionFailure, "overlay transaction synchronization requires the mutation lock"
+        end
+
+        environment["HOMEBREW_OVERLAY_OWNER_TRANSACTION_ID"] = owner_transaction.id
+        environment["HOMEBREW_OVERLAY_OWNER_TRANSACTION_LOCK_FD"] = TRANSACTION_LOCK_DESCRIPTOR.to_s
+        options[TRANSACTION_LOCK_DESCRIPTOR] = owner_transaction.owner_lock
+      end
+
+      [environment, options]
     end
-    private_class_method :mutation_environment
+    private_class_method :mutation_process_context
 
     sig { void }
     def self.release_mutation_lock!
@@ -1068,7 +1093,6 @@ module Homebrew
         lock.close unless lock.closed?
       end
       @mutation_lock = nil
-      @mutation_owner = nil
     end
     private_class_method :release_mutation_lock!
 
