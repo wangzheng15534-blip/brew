@@ -88,6 +88,21 @@ RSpec.describe Homebrew::Overlay do
     transaction&.rollback!
   end
 
+  it "recovers the staging rack from the build subprocess environment" do
+    add_base_formula("foo", "1.0")
+    transaction = T.must(described_class.begin_formula_transaction(formula, base_generation:))
+    described_class.unregister_transaction("foo", transaction)
+
+    with_env(HOMEBREW_OVERLAY_INSTALL_TRANSACTION_ID: transaction.id) do
+      expect(described_class.install_rack("foo")).to eq(transaction.staging_rack)
+      expect(described_class.install_rack("other")).to be_nil
+      transaction.staging_version.mkpath
+      expect(Homebrew::Overlay.valid_keg_path?(transaction.staging_version)).to be(true)
+    end
+  ensure
+    transaction&.rollback!
+  end
+
   it "rejects symlinked formula transaction control directories" do
     add_base_formula("foo", "1.0")
     outside = root/"outside-staging"
@@ -286,6 +301,17 @@ RSpec.describe Homebrew::Overlay do
     (user_cellar/"foo").unlink
     (user_cellar/"foo/2.0").mkpath
     expect(described_class.local_keg_realization?("foo", "2.0")).to be(true)
+  end
+
+  it "collapses an inherited-only version union back to the base rack" do
+    base_keg = add_base_formula("foo", "1.0")
+    (user_cellar/"foo").unlink
+    (user_cellar/"foo").mkpath
+    FileUtils.ln_s(base_keg, user_cellar/"foo/1.0")
+
+    expect(described_class.restore_inherited_rack!("foo")).to be(true)
+    expect(user_cellar/"foo").to be_a_symlink
+    expect((user_cellar/"foo").realpath).to eq(base_keg.parent)
   end
 
   it "rejects installing through an inherited version symlink in a local rack" do

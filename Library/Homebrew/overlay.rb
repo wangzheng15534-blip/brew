@@ -813,6 +813,9 @@ module Homebrew
       return true if @install_transactions.values.any? do |transaction|
         path.parent.expand_path == T.cast(transaction, FormulaTransaction).staging_rack.expand_path
       end
+      if (staging_rack = install_rack(path.parent.basename.to_s))
+        return path.parent.expand_path == staging_rack.expand_path
+      end
 
       cellar = canonical_path(path.parent.parent)
       candidate_cellars = [HOMEBREW_CELLAR]
@@ -1018,7 +1021,40 @@ module Homebrew
     sig { params(formula_name: String).returns(T.nilable(Pathname)) }
     def self.install_rack(formula_name)
       transaction = @install_transactions[formula_name]
-      transaction&.staging_rack
+      return transaction.staging_rack if transaction
+
+      transaction_id = ENV["HOMEBREW_OVERLAY_INSTALL_TRANSACTION_ID"]
+      return if transaction_id.nil? || transaction_id.empty?
+      unless active? && valid_formula_name?(formula_name) && transaction_id.match?(/\A[1-9][0-9]*-[0-9a-f]{24}\z/)
+        raise TransactionFailure, "invalid overlay build transaction"
+      end
+
+      transaction_dir = transactions_dir/transaction_id
+      recorded_formula = read_owned_file(
+        transaction_dir/"formula",
+        description: "overlay transaction formula",
+        max_bytes:   256,
+      )
+      return unless recorded_formula == "#{formula_name}\n"
+
+      state = read_owned_file(
+        transaction_dir/"state",
+        description: "overlay transaction state",
+        max_bytes:   32,
+      )
+      unless state == "staging\n"
+        raise TransactionFailure, "overlay build transaction does not match #{formula_name}"
+      end
+
+      staging_root = HOMEBREW_CELLAR/".homebrew-overlay-staging"/transaction_id
+      staging_rack = staging_root/formula_name
+      [staging_root.parent, staging_root, staging_rack].each do |directory|
+        unless directory.directory? && !directory.symlink? && directory.stat.uid == Process.uid && directory.writable?
+          raise TransactionFailure, "unsafe overlay build staging directory: #{directory}"
+        end
+      end
+
+      staging_rack
     end
 
     sig { params(formula_name: String).void }
@@ -1040,6 +1076,29 @@ module Homebrew
       elsif local_realizations?(formula_name)
         raise TransactionFailure, "formula rack already contains a local realization: #{rack}"
       end
+    end
+
+    sig { params(formula_name: String).returns(T::Boolean) }
+    def self.restore_inherited_rack!(formula_name)
+      return false unless active? && valid_formula_name?(formula_name)
+
+      rack = HOMEBREW_CELLAR/formula_name
+      return false unless rack.directory? && !rack.symlink? && base_formula_available?(formula_name)
+      return false if local_realizations?(formula_name)
+
+      rack.children.each do |child|
+        unless child.symlink? && inherited_keg?(child)
+          raise TransactionFailure, "refusing to collapse non-inherited formula rack: #{rack}"
+        end
+
+        child.unlink
+      end
+      rack.rmdir
+      File.symlink(base_cellar/formula_name, rack)
+      fsync_directory!(rack.parent)
+      true
+    rescue Errno::EEXIST, Errno::ENOTEMPTY => e
+      raise TransactionFailure, "could not restore inherited formula rack #{rack}: #{e.message}"
     end
 
     # Atomically exchange two paths on Linux. Both paths are required to live

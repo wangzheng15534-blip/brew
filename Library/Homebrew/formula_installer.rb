@@ -1300,26 +1300,33 @@ on_request: installed_on_request?, options:)
       formula_path,
     ].concat(build_argv)
 
-    Sandbox.run_or_fork(*args, step: "building") do |sandbox|
-      sandbox.allow_read_if_exists path: formula_path
-      if Homebrew::EnvConfig.require_tap_trust?
-        require "trust"
-        sandbox.allow_read_if_exists path: Homebrew::Trust.trust_file
+    build_environment = if (transaction = @overlay_transaction)
+      { "HOMEBREW_OVERLAY_INSTALL_TRANSACTION_ID" => transaction.id }
+    else
+      {}
+    end
+    with_env(build_environment) do
+      Sandbox.run_or_fork(*args, step: "building") do |sandbox|
+        sandbox.allow_read_if_exists path: formula_path
+        if Homebrew::EnvConfig.require_tap_trust?
+          require "trust"
+          sandbox.allow_read_if_exists path: Homebrew::Trust.trust_file
+        end
+        formula.logs.mkpath
+        sandbox.record_log(formula.logs/"build.sandbox.log")
+        if interactive?
+          sandbox.allow_write_path(Dir.home)
+        else
+          sandbox.deny_read_home
+        end
+        sandbox.allow_write_temp_and_cache
+        sandbox.allow_write_log(formula)
+        sandbox.allow_cvs
+        sandbox.allow_fossil
+        sandbox.allow_write_xcode
+        sandbox.allow_write_cellar(formula)
+        sandbox.deny_all_network unless formula.network_access_allowed?(:build)
       end
-      formula.logs.mkpath
-      sandbox.record_log(formula.logs/"build.sandbox.log")
-      if interactive?
-        sandbox.allow_write_path(Dir.home)
-      else
-        sandbox.deny_read_home
-      end
-      sandbox.allow_write_temp_and_cache
-      sandbox.allow_write_log(formula)
-      sandbox.allow_cvs
-      sandbox.allow_fossil
-      sandbox.allow_write_xcode
-      sandbox.allow_write_cellar(formula)
-      sandbox.deny_all_network unless formula.network_access_allowed?(:build)
     end
 
     formula.update_head_version
