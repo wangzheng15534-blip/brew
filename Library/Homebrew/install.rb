@@ -110,6 +110,7 @@ module Homebrew
 
         # Check if the installed formula is from a different tap
         if formula.any_version_installed? &&
+           !(Homebrew::Overlay.active? && Homebrew::Overlay.inherited_only_formula?(formula)) &&
            (current_tap_name = formula.tap&.name.presence) &&
            (installed_keg_tab = formula.any_installed_keg&.tab.presence) &&
            (installed_tap_name = installed_keg_tab.tap&.name.presence) &&
