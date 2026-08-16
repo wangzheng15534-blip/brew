@@ -1,0 +1,47 @@
+name: Rebase overlay branch onto upstream
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rebase-overlay-branch
+  cancel-in-progress: false
+
+jobs:
+  rebase:
+    if: github.repository == 'wignerStan/brew'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the custom branch
+        uses: actions/checkout@v4
+        with:
+          ref: overlay-store
+          fetch-depth: 0
+
+      - name: Rebase onto upstream Homebrew main
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git remote add upstream https://github.com/Homebrew/brew.git
+          git fetch --prune upstream main
+
+          before=$(git rev-parse HEAD)
+          if ! git rebase upstream/main; then
+            git rebase --abort || true
+            echo "Upstream rebase has conflicts; overlay-store was left unchanged." >&2
+            exit 1
+          fi
+
+          after=$(git rev-parse HEAD)
+          if [[ "$before" == "$after" ]]; then
+            echo "overlay-store is already based on upstream/main."
+            exit 0
+          fi
+
+          git push --force-with-lease origin HEAD:overlay-store
