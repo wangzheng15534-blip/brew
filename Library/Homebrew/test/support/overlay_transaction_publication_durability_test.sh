@@ -46,9 +46,9 @@ ordered(commit, [
 
 exchange = body(ruby, "    def self.atomic_exchange!(left, right)\n", "\n    # Remove a newly created",)
 ordered(exchange, [
-    "result = syscall.call",
-    "parents = [left.parent, right.parent].uniq",
-    "parents.each { |parent| fsync_directory!(parent) }",
+    "mv = %w[/bin/mv /usr/bin/mv].find",
+    "Homebrew.safe_system mv, \"--exchange\", \"--no-target-directory\"",
+    "[left.parent, right.parent].uniq.each { |parent| fsync_directory!(parent) }",
 ], "rack-exchange durability")
 
 tree = body(
