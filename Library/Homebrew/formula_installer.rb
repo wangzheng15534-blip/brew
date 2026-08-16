@@ -1308,6 +1308,7 @@ on_request: installed_on_request?, options:)
     with_env(build_environment) do
       Sandbox.run_or_fork(*args, step: "building") do |sandbox|
         sandbox.allow_read_if_exists path: formula_path
+        sandbox.allow_read_if_exists path: transaction.transaction_dir if transaction
         if Homebrew::EnvConfig.require_tap_trust?
           require "trust"
           sandbox.allow_read_if_exists path: Homebrew::Trust.trust_file
