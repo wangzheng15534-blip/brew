@@ -3,7 +3,6 @@
 
 require "env_config"
 require "fileutils"
-require "rbconfig"
 require "securerandom"
 require "utils/popen"
 
@@ -51,28 +50,16 @@ module Homebrew
     TRANSACTION_MARKER = ".brew-overlay-transaction"
     BASE_GENERATION_MARKER = ".brew-overlay-base-generation"
     BASE_GENERATION_PATTERN = /\A[0-9a-f]{64}\z/
-    AT_FDCWD = -100
-    RENAME_EXCHANGE = 2
     MUTATION_LOCK_DESCRIPTOR = 198
     TRANSACTION_LOCK_DESCRIPTOR = 199
     MAX_TRANSACTION_MARKER_BYTES = 256
     MAX_MANAGED_STATE_BYTES = 64 * 1024 * 1024
-    RENAMEAT2_SYSCALLS = T.let(
-      {
-        "x86_64"  => 316,
-        "aarch64" => 276,
-        "arm64"   => 276,
-        "ppc64le" => 357,
-        "s390x"   => 347,
-        "riscv64" => 276,
-      }.freeze,
-      T::Hash[String, Integer],
-    )
 
     # A durable installation transaction for replacing an inherited formula.
     # Build and pour operations use a staging rack. Publication prepares a
-    # complete native rack and uses Linux renameat2(RENAME_EXCHANGE) to swap it
-    # with the inherited rack in one filesystem operation.
+    # complete native rack and uses GNU mv --exchange (backed by Linux
+    # renameat2(RENAME_EXCHANGE)) to swap it with the inherited rack in one
+    # filesystem operation.
     class FormulaTransaction
       extend T::Sig
 
@@ -486,7 +473,7 @@ module Homebrew
       end
     end
 
-    private_constant :TRANSACTION_MARKER, :BASE_GENERATION_PATTERN, :AT_FDCWD, :RENAME_EXCHANGE, :RENAMEAT2_SYSCALLS
+    private_constant :TRANSACTION_MARKER, :BASE_GENERATION_PATTERN
 
     sig { returns(T::Boolean) }
     def self.active?
@@ -1060,12 +1047,6 @@ module Homebrew
     # redirected through an arbitrary user path.
     sig { params(left: Pathname, right: Pathname).void }
     def self.atomic_exchange!(left, right)
-      begin
-        require "fiddle"
-      rescue LoadError => e
-        raise TransactionFailure, "atomic overlay publication requires the vendored fiddle gem: #{e.message}"
-      end
-
       cellar = HOMEBREW_CELLAR.expand_path
       [left, right].each do |path|
         unless path_under?(path.expand_path, cellar) && (path.exist? || path.symlink?)
@@ -1073,26 +1054,16 @@ module Homebrew
         end
       end
 
-      syscall_number = RENAMEAT2_SYSCALLS[RbConfig::CONFIG.fetch("host_cpu")]
-      if syscall_number.nil?
-        raise TransactionFailure, "atomic overlay publication is unsupported on this CPU architecture"
+      mv = %w[/bin/mv /usr/bin/mv].find { |candidate| File.executable?(candidate) }
+      raise TransactionFailure, "atomic overlay publication requires GNU mv with --exchange" unless mv
+
+      begin
+        Homebrew.safe_system mv, "--exchange", "--no-target-directory", left.to_s, right.to_s
+      rescue ErrorDuringExecution, SystemCallError => e
+        raise TransactionFailure, "atomic overlay rack exchange failed: #{e.message}"
       end
 
-      syscall = Fiddle::Function.new(
-        Fiddle.dlopen(nil)["syscall"],
-        [Fiddle::TYPE_LONG, Fiddle::TYPE_LONG, Fiddle::TYPE_VOIDP,
-         Fiddle::TYPE_LONG, Fiddle::TYPE_VOIDP, Fiddle::TYPE_INT],
-        Fiddle::TYPE_LONG,
-      )
-      result = syscall.call(syscall_number, AT_FDCWD, left.to_s, AT_FDCWD, right.to_s, RENAME_EXCHANGE)
-      if result.zero?
-        parents = [left.parent, right.parent].uniq
-        parents.each { |parent| fsync_directory!(parent) }
-        return
-      end
-
-      error = Fiddle.last_error
-      raise SystemCallError.new("atomic overlay rack exchange failed", error)
+      [left.parent, right.parent].uniq.each { |parent| fsync_directory!(parent) }
     end
 
     # Remove a newly created, not-yet-committed local keg after an overlay

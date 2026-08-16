@@ -81,7 +81,6 @@ end
 
 # vendored gems (no group)
 gem "concurrent-ruby"
-gem "fiddle"
 gem "patchelf"
 gem "plist"
 gem "ruby-macho"
