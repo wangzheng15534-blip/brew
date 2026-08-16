@@ -3,6 +3,7 @@
 
 require "extend/ENV/shared"
 require "development_tools"
+require "overlay"
 require "utils/output"
 
 # ### Why `superenv`?
@@ -171,6 +172,13 @@ module Superenv
         .map { |d| d.opt_libexec/"bin" }
   end
 
+  sig { returns(T.nilable(Pathname)) }
+  def homebrew_overlay_base_prefix
+    return unless Homebrew::Overlay.active?
+
+    Homebrew::Overlay.base_prefix
+  end
+
   sig { returns(T.nilable(PATH)) }
   def determine_path
     path = PATH.new(Superenv.bin)
@@ -197,9 +205,11 @@ module Superenv
 
   sig { returns(T.nilable(PATH)) }
   def determine_pkg_config_path
+    overlay_base = homebrew_overlay_base_prefix
     PATH.new(
       deps.map { |d| d.opt_lib/"pkgconfig" },
       deps.map { |d| d.opt_share/"pkgconfig" },
+      overlay_base ? [overlay_base/"lib/pkgconfig", overlay_base/"share/pkgconfig"] : [],
     ).existing
   end
 
@@ -212,9 +222,11 @@ module Superenv
 
   sig { returns(T.nilable(PATH)) }
   def determine_aclocal_path
+    overlay_base = homebrew_overlay_base_prefix
     PATH.new(
       keg_only_deps.map { |d| d.opt_share/"aclocal" },
       HOMEBREW_PREFIX/"share/aclocal",
+      overlay_base ? overlay_base/"share/aclocal" : [],
     ).existing
   end
 
@@ -225,15 +237,21 @@ module Superenv
 
   sig { returns(T.nilable(PATH)) }
   def determine_isystem_paths
+    overlay_base = homebrew_overlay_base_prefix
     PATH.new(
       HOMEBREW_PREFIX/"include",
+      overlay_base ? overlay_base/"include" : [],
       homebrew_extra_isystem_paths,
     ).existing
   end
 
   sig { returns(T.nilable(PATH)) }
   def determine_include_paths
-    PATH.new(keg_only_deps.map(&:opt_include)).existing
+    overlay_base = homebrew_overlay_base_prefix
+    PATH.new(
+      keg_only_deps.map(&:opt_include),
+      overlay_base ? overlay_base/"include" : [],
+    ).existing
   end
 
   sig { returns(T::Array[Pathname]) }
@@ -261,6 +279,9 @@ module Superenv
     paths += keg_only_deps.reject { |dep| dep.name.match?(/^llvm(@\d+)?$/) }
                           .map(&:opt_lib)
     paths << (HOMEBREW_PREFIX/"lib")
+    if (overlay_base = homebrew_overlay_base_prefix)
+      paths << (overlay_base/"lib")
+    end
 
     paths += homebrew_extra_library_paths
     PATH.new(paths).existing
@@ -273,10 +294,12 @@ module Superenv
 
   sig { returns(T.nilable(PATH)) }
   def determine_cmake_prefix_path
+    overlay_base = homebrew_overlay_base_prefix
     PATH.new(
       Superenv.bin&.parent,
       keg_only_deps.map(&:opt_prefix),
       HOMEBREW_PREFIX.to_s,
+      overlay_base || [],
     ).existing
   end
 
