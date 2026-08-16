@@ -2,6 +2,7 @@
 # Aggregate regression gate for the complete native-overlay review. Every
 # standalone overlay support test must be listed here before this gate can pass.
 set -euo pipefail
+umask 077
 
 repo="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd -P)}"
 repo="$(cd "${repo}" && pwd -P)"
@@ -23,6 +24,7 @@ tests=(
   overlay_rack_recovery_exactness_test.sh
   overlay_view_reconciliation_test.sh
   overlay_ruby_reader_integrity_test.sh
+  overlay_runtime_boot_test.sh
   overlay_marker_reader_integrity_test.sh
   overlay_removal_partition_test.sh
   overlay_commit_boundary_test.sh

@@ -3,7 +3,6 @@
 
 require "env_config"
 require "fileutils"
-require "fiddle"
 require "rbconfig"
 require "securerandom"
 require "utils/popen"
@@ -1061,6 +1060,12 @@ module Homebrew
     # redirected through an arbitrary user path.
     sig { params(left: Pathname, right: Pathname).void }
     def self.atomic_exchange!(left, right)
+      begin
+        require "fiddle"
+      rescue LoadError => e
+        raise TransactionFailure, "atomic overlay publication requires the vendored fiddle gem: #{e.message}"
+      end
+
       cellar = HOMEBREW_CELLAR.expand_path
       [left, right].each do |path|
         unless path_under?(path.expand_path, cellar) && (path.exist? || path.symlink?)

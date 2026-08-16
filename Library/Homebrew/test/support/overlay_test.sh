@@ -1,5 +1,6 @@
 #!/bin/bash
 set -euo pipefail
+umask 077
 
 repository="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd -P)}"
 repository="$(cd "${repository}" && pwd -P)"
