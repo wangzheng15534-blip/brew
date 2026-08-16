@@ -210,7 +210,11 @@ class Keg
 
   sig { params(path: Pathname).void }
   def initialize(path)
-    if path.to_s.start_with?("#{HOMEBREW_PREFIX}/opt/")
+    overlay_opt_path = path.to_s.start_with?("#{HOMEBREW_PREFIX}/opt/")
+    if Homebrew::Overlay.active?
+      overlay_opt_path ||= path.to_s.start_with?("#{Homebrew::Overlay.base_prefix}/opt/")
+    end
+    if overlay_opt_path
       # An inherited overlay opt link points at the administrator opt link,
       # which is itself a symlink into the lower Cellar. `resolved_path` only
       # expands the first hop on this layout, so use realpath to validate the
