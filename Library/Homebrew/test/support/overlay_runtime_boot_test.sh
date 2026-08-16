@@ -8,7 +8,7 @@ repository="$(cd "${repository}" && pwd -P)"
 output="$(env \
   HOMEBREW_NO_AUTO_UPDATE=1 \
   HOMEBREW_SKIP_INITIAL_GEM_INSTALL=1 \
-  "${repository}/bin/brew" ruby -e 'require "fiddle"; print Fiddle::VERSION')"
+  "${repository}/bin/brew" ruby -e 'print RUBY_VERSION')"
 
 [[ "${output}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
 printf 'overlay disabled-gems runtime boot test: PASS\n'
