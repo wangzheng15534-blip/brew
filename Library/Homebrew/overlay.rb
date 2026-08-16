@@ -458,7 +458,7 @@ module Homebrew
         end
       ensure
         owner_lock_path_present = @owner_lock_path.exist? || @owner_lock_path.symlink?
-        release_owner_lock! if !owner_lock_path_present
+        release_owner_lock! unless owner_lock_path_present
       end
 
       sig { params(path: Pathname).void }
