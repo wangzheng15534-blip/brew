@@ -210,15 +210,20 @@ class Keg
 
   sig { params(path: Pathname).void }
   def initialize(path)
-    overlay_opt_path = path.to_s.start_with?("#{HOMEBREW_PREFIX}/opt/")
+    keg_record_path = path.to_s.start_with?("#{HOMEBREW_PREFIX}/opt/")
     if Homebrew::Overlay.active?
-      overlay_opt_path ||= path.to_s.start_with?("#{Homebrew::Overlay.base_prefix}/opt/")
+      base_prefix = Homebrew::Overlay.base_prefix
+      keg_record_path ||= [
+        "#{HOMEBREW_PREFIX}/var/homebrew/linked/",
+        "#{base_prefix}/opt/",
+        "#{base_prefix}/var/homebrew/linked/",
+      ].any? { |root| path.to_s.start_with?(root) }
     end
-    if overlay_opt_path
-      # An inherited overlay opt link points at the administrator opt link,
-      # which is itself a symlink into the lower Cellar. `resolved_path` only
-      # expands the first hop on this layout, so use realpath to validate the
-      # actual keg against both the user and lower Cellars.
+    if keg_record_path
+      # Inherited overlay keg records point at the administrator record, which
+      # is itself a symlink into the lower Cellar. `resolved_path` only expands
+      # the first hop on this layout, so use realpath to validate the actual
+      # keg against both the user and lower Cellars.
       path = path.realpath
     end
     raise "#{path} is not a valid keg" unless Homebrew::Overlay.valid_keg_path?(path)
