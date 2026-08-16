@@ -74,7 +74,11 @@ record = body(
 if "durable_atomic_write!(marker, \"#{generation}\\n\", mode: 0600)" not in record:
     raise SystemExit("base-generation marker is not durably published")
 
-cleanup = body(ruby, "      def cleanup_paths!\n", "\n      ensure\n        release_owner_lock!",)
+cleanup = body(
+    ruby,
+    "      def cleanup_paths!\n",
+    "\n      sig { params(path: Pathname).void }\n      def remove_tree_durable!",
+)
 required_cleanup = [
     "remove_tree_durable!(@staging_root)",
     "remove_tree_durable!(@replacement_root)",

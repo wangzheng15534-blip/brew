@@ -457,7 +457,8 @@ module Homebrew
           Overlay.fsync_directory!(@owner_lock_path.parent)
         end
       ensure
-        release_owner_lock!
+        owner_lock_path_present = @owner_lock_path.exist? || @owner_lock_path.symlink?
+        release_owner_lock! if !owner_lock_path_present
       end
 
       sig { params(path: Pathname).void }

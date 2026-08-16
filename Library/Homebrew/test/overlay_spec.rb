@@ -60,6 +60,23 @@ RSpec.describe Homebrew::Overlay do
     expect(described_class.local_realizations?("foo")).to be(false)
   end
 
+  it "resolves double-hop inherited opt and linked keg records" do
+    base_keg = add_base_formula("foo", "1.0")
+    base_opt = base_prefix/"opt/foo"
+    base_linked = base_prefix/"var/homebrew/linked/foo"
+    user_opt = prefix/"opt/foo"
+    user_linked = prefix/"var/homebrew/linked/foo"
+
+    [base_opt, base_linked, user_opt, user_linked].each { |path| path.dirname.mkpath }
+    FileUtils.ln_s(base_keg, base_opt)
+    FileUtils.ln_s(base_keg, base_linked)
+    FileUtils.ln_s(base_opt, user_opt)
+    FileUtils.ln_s(base_linked, user_linked)
+
+    expect(Keg.new(user_opt.resolved_path).to_path).to eq(base_keg.to_s)
+    expect(Keg.new(user_linked.resolved_path).to_path).to eq(base_keg.to_s)
+  end
+
   it "builds an inherited replacement in a staging rack" do
     base_keg = add_base_formula("foo", "1.0")
     transaction = T.must(described_class.begin_formula_transaction(formula, base_generation:))
@@ -82,8 +99,8 @@ RSpec.describe Homebrew::Overlay do
       expect(path).not_to be_a_symlink
       expect(path.stat.mode & 0777).to eq(0600)
     end
-    expect(transaction.transaction_dir/"state").to have_file_content("staging\n")
-    expect(transaction.transaction_dir/"base_generation").to have_file_content("#{base_generation}\n")
+    expect((transaction.transaction_dir/"state").read).to eq("staging\n")
+    expect((transaction.transaction_dir/"base_generation").read).to eq("#{base_generation}\n")
   ensure
     transaction&.rollback!
   end
@@ -125,7 +142,7 @@ RSpec.describe Homebrew::Overlay do
     expect do
       transaction.rollback!
     end.to raise_error(Homebrew::Overlay::TransactionFailure, /unsafe overlay transaction owner lock/)
-    expect(peer).to have_file_content("")
+    expect(peer.read).to eq("")
     expect(transaction.transaction_dir).to be_a_directory
 
     peer.unlink
@@ -148,13 +165,13 @@ RSpec.describe Homebrew::Overlay do
     expect((user_cellar/"foo/1.0").realpath).to eq(base_keg)
     expect(transaction.replacement_rack).to be_a_symlink
     expect(user_cellar/"foo/2.0/.brew-overlay-transaction").to exist
-    expect(user_cellar/"foo/2.0/bin/foo").to have_file_content("prefix=#{user_cellar}/foo/2.0\n")
+    expect((user_cellar/"foo/2.0/bin/foo").read).to eq("prefix=#{user_cellar}/foo/2.0\n")
     expect((user_cellar/"foo/2.0/absolute-link").readlink.to_s).to eq((user_cellar/"foo/2.0/bin/foo").to_s)
 
     transaction.commit!
 
     expect(user_cellar/"foo/2.0/.brew-overlay-transaction").not_to exist
-    expect(user_cellar/"foo/2.0/.brew-overlay-base-generation").to have_file_content("#{base_generation}\n")
+    expect((user_cellar/"foo/2.0/.brew-overlay-base-generation").read).to eq("#{base_generation}\n")
     expect(transaction.transaction_dir).not_to exist
     expect(transaction.replacement_rack).not_to exist
     expect(described_class).to have_received(:sync!)
@@ -166,7 +183,8 @@ RSpec.describe Homebrew::Overlay do
     stage(transaction)
     events = T.let([], T::Array[T.untyped])
     state_file = transaction.transaction_dir/"state"
-    transaction_marker = transaction.final_version/".brew-overlay-transaction"
+    staged_transaction_marker = transaction.replacement_rack/transaction.version/".brew-overlay-transaction"
+    final_transaction_marker = transaction.final_version/".brew-overlay-transaction"
     base_marker = transaction.final_version/".brew-overlay-base-generation"
 
     allow(described_class).to receive(:durable_atomic_write!).and_wrap_original do |original, path, contents, mode:|
@@ -194,7 +212,7 @@ RSpec.describe Homebrew::Overlay do
     transaction.commit!
 
     expected = [
-      [:write, transaction_marker, "#{transaction.id}\n"],
+      [:write, staged_transaction_marker, "#{transaction.id}\n"],
       [:fsync, transaction.staging_rack],
       [:fsync, transaction.replacement_rack],
       [:write, state_file, "publishing\n"],
@@ -203,7 +221,7 @@ RSpec.describe Homebrew::Overlay do
       [:fsync_tree, transaction.final_version],
       [:write, base_marker, "#{base_generation}\n"],
       [:write, state_file, "committing\n"],
-      [:unlink, transaction_marker],
+      [:unlink, final_transaction_marker],
       [:write, state_file, "committed\n"],
     ]
     positions = expected.map { |event| events.index(event) }
@@ -222,7 +240,7 @@ RSpec.describe Homebrew::Overlay do
     expect do
       transaction.commit!
     end.to raise_error(Homebrew::Overlay::TransactionFailure, /unsafe overlay formula transaction marker/)
-    expect(peer).to have_file_content("#{transaction.id}\n")
+    expect(peer.read).to eq("#{transaction.id}\n")
 
     peer.unlink
     transaction.rollback!
@@ -241,6 +259,7 @@ RSpec.describe Homebrew::Overlay do
     replacement.chmod 0600
     flags = File::RDONLY | File::NOFOLLOW
 
+    allow(File).to receive(:open).and_call_original
     expect(File).to receive(:open).with(marker, flags).and_wrap_original do |original, *arguments|
       file = original.call(*arguments)
       marker.rename(opened_marker)
@@ -370,6 +389,7 @@ RSpec.describe Homebrew::Overlay do
     replacement.chmod 0600
     flags = File::RDONLY | File::NOFOLLOW
 
+    allow(File).to receive(:open).and_call_original
     expect(File).to receive(:open).with(marker, flags).and_wrap_original do |original, *arguments|
       file = original.call(*arguments)
       marker.rename(opened_marker)
@@ -408,6 +428,7 @@ RSpec.describe Homebrew::Overlay do
     state_file = prefix/"var/homebrew/overlay/view.state"
     state_file.dirname.mkpath
     state_file.binwrite("opt/foo\0#{target}\0")
+    state_file.chmod 0600
 
     expect(described_class.remove_inherited_prefix_link!(link)).to be(true)
     expect(link).not_to be_a_symlink
@@ -421,11 +442,14 @@ RSpec.describe Homebrew::Overlay do
     state_file = prefix/"var/homebrew/overlay/view.state"
     state_file.dirname.mkpath
     state_file.binwrite("opt/foo\0#{target}\0")
+    state_file.chmod 0600
     opened_state = root/"opened-view-state"
     replacement = root/"replacement-view-state"
     replacement.binwrite("opt/foo\0#{target}\0")
+    replacement.chmod 0600
     flags = File::RDONLY | File::NOFOLLOW
 
+    allow(File).to receive(:open).and_call_original
     expect(File).to receive(:open).with(state_file, flags).and_wrap_original do |original, *arguments|
       file = original.call(*arguments)
       state_file.rename(opened_state)
@@ -449,6 +473,7 @@ RSpec.describe Homebrew::Overlay do
     state_file = prefix/"var/homebrew/overlay/view.state"
     state_file.dirname.mkpath
     state_file.binwrite("opt/foo\0#{root}/outside/foo\0")
+    state_file.chmod 0600
 
     expect do
       described_class.remove_inherited_prefix_link!(link)

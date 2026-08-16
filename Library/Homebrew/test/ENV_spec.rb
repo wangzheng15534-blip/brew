@@ -253,6 +253,33 @@ RSpec.describe "ENV" do
       expect(env.keg_only_deps).to eq([])
     end
 
+    it "exposes inherited base roots to overlay builds" do
+      overlay_base = mktmpdir/"base"
+      %w[include lib lib/pkgconfig share/pkgconfig share/aclocal].each do |relative|
+        (overlay_base/relative).mkpath
+      end
+      allow(Homebrew::Overlay).to receive_messages(active?: true, base_prefix: overlay_base)
+
+      cmake_prefix_path = env.method(:determine_cmake_prefix_path).call.to_s.split(File::PATH_SEPARATOR)
+      expect(cmake_prefix_path).to include(overlay_base.to_s)
+      expect(env.method(:determine_pkg_config_path).call.to_s.split(File::PATH_SEPARATOR)).to include(
+        (overlay_base/"lib/pkgconfig").to_s,
+        (overlay_base/"share/pkgconfig").to_s,
+      )
+      expect(env.method(:determine_aclocal_path).call.to_s.split(File::PATH_SEPARATOR)).to include(
+        (overlay_base/"share/aclocal").to_s,
+      )
+      expect(env.method(:determine_isystem_paths).call.to_s.split(File::PATH_SEPARATOR)).to include(
+        (overlay_base/"include").to_s,
+      )
+      expect(env.method(:determine_include_paths).call.to_s.split(File::PATH_SEPARATOR)).to include(
+        (overlay_base/"include").to_s,
+      )
+      expect(env.method(:determine_library_paths).call.to_s.split(File::PATH_SEPARATOR)).to include(
+        (overlay_base/"lib").to_s,
+      )
+    end
+
     describe "#cxx11" do
       it "supports gcc-11" do
         env["HOMEBREW_CC"] = "gcc-11"
